@@ -58,6 +58,7 @@ class Item:
     id: int = 0
     category: str = ""
     summary_html: str = ""
+    summaries: dict[str, str] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #

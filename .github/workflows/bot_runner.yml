@@ -55,6 +55,9 @@ jobs:
           TZ: Asia/Tehran
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
           TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
           ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -64,22 +67,26 @@ jobs:
           DEBUG: ${{ vars.DEBUG || 'false' }}
         run: python main.py
 
-      # Dedup hashes and AI counters live in data/state.json; each run commits
-      # the new snapshot so the next scheduled run sees it.
+      # Dedup hashes, AI counters, users and force-join channels live in data/;
+      # each run commits the new snapshot so the next scheduled run sees it.
       - name: Persist state
         if: always() && (github.event_name != 'workflow_dispatch' || inputs.dry_run != true)
         run: |
-          if [ ! -f data/state.json ]; then
-            echo "no state file to commit"
+          files=""
+          for f in data/state.json data/users.json data/channels.json; do
+            if [ -f "$f" ]; then files="$files $f"; fi
+          done
+          if [ -z "$files" ]; then
+            echo "no data files to commit"
             exit 0
           fi
-          if [ -z "$(git status --porcelain data/state.json)" ]; then
-            echo "state unchanged"
+          git add $files
+          if git diff --cached --quiet; then
+            echo "data unchanged"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/state.json
           git commit -m "chore: update bot state [skip ci]"
           git pull --rebase --autostash
           git push

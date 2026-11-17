@@ -7,6 +7,7 @@ import logging
 import re
 import threading
 import time
+from datetime import datetime
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
@@ -396,7 +397,7 @@ class TelegramSender:
             "offset": offset,
             "timeout": 0,
             "limit": 100,
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "callback_query"],
         }
         data = self._call("getUpdates", payload)
         if not data:
@@ -404,28 +405,62 @@ class TelegramSender:
         result = data.get("result")
         return result if isinstance(result, list) else []
 
-    def send_message(self, chat_id: int | str, text: str) -> bool:
+    def get_chat_member(self, chat_id: int | str, channel: str) -> dict | None:
+        data = self._call(
+            "getChatMember", {"chat_id": channel, "user_id": chat_id}
+        )
+        if not data:
+            return None
+        result = data.get("result")
+        return result if isinstance(result, dict) else None
+
+    def answer_callback_query(self, callback_query_id: str, text: str = "") -> bool:
+        payload = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text[:200]
+        return self._call("answerCallbackQuery", payload) is not None
+
+    def send_message(
+        self,
+        chat_id: int | str,
+        text: str,
+        reply_markup: dict | None = None,
+    ) -> bool:
         cleaned = sanitize_html(text)
         if not cleaned:
             return False
         ok = True
+        markup = reply_markup
         for chunk in split_html(cleaned):
             self._pace(chat_id)
-            status = self._send_text(chat_id, chunk, "HTML")
+            status = self._send_text(chat_id, chunk, "HTML", markup)
+            markup = None
             if status == "parse_error":
                 log.warning("HTML parse failed chat=%s, retrying as plain text", chat_id)
                 for part in _split_plain(html_to_plain(chunk), 3900):
                     self._pace(chat_id)
-                    if not self._send_plain(chat_id, part):
+                    if not self._send_plain(chat_id, part, markup):
                         ok = False
+                    markup = None
             elif status != "ok":
                 ok = False
         return ok
 
-    def _send_plain(self, chat_id: int | str, text: str) -> bool:
-        return self._send_text(chat_id, text, None) == "ok"
+    def _send_plain(
+        self,
+        chat_id: int | str,
+        text: str,
+        reply_markup: dict | None = None,
+    ) -> bool:
+        return self._send_text(chat_id, text, None, reply_markup) == "ok"
 
-    def _send_text(self, chat_id: int | str, text: str, parse_mode: str | None) -> str:
+    def _send_text(
+        self,
+        chat_id: int | str,
+        text: str,
+        parse_mode: str | None,
+        reply_markup: dict | None = None,
+    ) -> str:
         payload = {
             "chat_id": chat_id,
             "text": text,
@@ -433,6 +468,8 @@ class TelegramSender:
         }
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         for attempt in range(3):
             response = self._post("sendMessage", payload)
             if response is None:
@@ -532,28 +569,186 @@ class TelegramSender:
 # --------------------------------------------------------------------------- #
 # Onboarding / commands
 # --------------------------------------------------------------------------- #
-def handle_updates(updates: list[dict], sender: TelegramSender) -> int:
+def _is_admin(chat_id: int | str) -> bool:
+    if not config.ADMIN_CHAT_ID:
+        return False
+    return str(chat_id) == str(config.ADMIN_CHAT_ID)
+
+
+def _language_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🇮🇷 فارسی", "callback_data": "lang:fa"},
+                {"text": "🇬🇧 English", "callback_data": "lang:en"},
+            ]
+        ]
+    }
+
+
+def _join_keyboard(channels: list[str]) -> dict:
+    from channels_store import join_url
+
+    return {
+        "inline_keyboard": [
+            [{"text": f"📢 {channel}", "url": join_url(channel)}]
+            for channel in channels
+        ]
+    }
+
+
+def _handle_message(message: dict, sender: TelegramSender, users, channels) -> None:
+    chat = message.get("chat") or {}
+    if chat.get("type") != "private":
+        return
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return
+    text = (message.get("text") or "").strip()
+    if not text:
+        return
+    now = datetime.now(config.TEHRAN_TZ)
+    admin = _is_admin(chat_id)
+    if not admin and users.rate_limited(chat_id, now):
+        return
+    if not text.startswith("/"):
+        return
+
+    from_user = message.get("from") or {}
+    first_name = str(from_user.get("first_name") or "")
+    username = str(from_user.get("username") or "")
+
+    if not admin and channels.channels:
+        missing = channels.missing_for(sender, chat_id)
+        if missing:
+            sender.send_message(
+                chat_id,
+                config.join_required_text(),
+                reply_markup=_join_keyboard(missing),
+            )
+            return
+
+    head, _, arg = text.partition(" ")
+    command = head.split("@", 1)[0].lower()
+    arg = arg.strip()
+
+    if command == "/start":
+        _, created = users.ensure(chat_id, first_name, username, now)
+        stored = users.lang_of(chat_id)
+        if created or stored not in config.SUPPORTED_LANGS:
+            sender.send_message(
+                chat_id,
+                config.choose_language_text(),
+                reply_markup=_language_keyboard(),
+            )
+        else:
+            sender.send_message(chat_id, config.welcome_text(stored, chat_id))
+        return
+
+    if command == "/lang":
+        if users.get(chat_id) is None:
+            users.ensure(chat_id, first_name, username, now)
+        sender.send_message(
+            chat_id,
+            config.choose_language_text(),
+            reply_markup=_language_keyboard(),
+        )
+        return
+
+    if command == "/help":
+        sender.send_message(chat_id, config.help_text(users.lang(chat_id)))
+        return
+
+    if command not in ("/stats", "/addchannel", "/removechannel"):
+        return
+    if not admin:
+        return
+
+    if command == "/stats":
+        result = users.stats(now)
+        sender.send_message(
+            chat_id, config.stats_text(result["total"], result["active"])
+        )
+        return
+
+    if not arg:
+        sender.send_message(chat_id, config.channel_usage_text())
+        return
+    if command == "/addchannel":
+        added, channel = channels.add(arg)
+        if not channel:
+            sender.send_message(chat_id, config.channel_usage_text())
+        elif added:
+            channels.flush()
+            sender.send_message(chat_id, config.channel_added_text(channel))
+        else:
+            sender.send_message(
+                chat_id, f"ℹ️ کانال <code>{html.escape(channel)}</code> از قبل ثبت شده."
+            )
+        return
+
+    removed, channel = channels.remove(arg)
+    if not channel:
+        sender.send_message(chat_id, config.channel_usage_text())
+    elif removed:
+        channels.flush()
+        sender.send_message(chat_id, config.channel_removed_text(channel))
+    else:
+        sender.send_message(chat_id, config.channel_missing_text(channel))
+
+
+def _handle_callback(callback: dict, sender: TelegramSender, users) -> None:
+    data = str(callback.get("data") or "")
+    callback_id = str(callback.get("id") or "")
+    message = callback.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return
+
+    if not data.startswith("lang:"):
+        sender.answer_callback_query(callback_id)
+        return
+    lang = data.split(":", 1)[1]
+    if lang not in config.SUPPORTED_LANGS:
+        sender.answer_callback_query(callback_id)
+        return
+
+    from_user = callback.get("from") or {}
+    now = datetime.now(config.TEHRAN_TZ)
+    users.ensure(
+        chat_id,
+        str(from_user.get("first_name") or ""),
+        str(from_user.get("username") or ""),
+        now,
+    )
+    users.set_lang(chat_id, lang)
+    sender.answer_callback_query(
+        callback_id,
+        "زبان فارسی ذخیره شد." if lang == "fa" else "Language saved.",
+    )
+    sender.send_message(chat_id, config.welcome_text(lang, chat_id))
+
+
+def handle_updates(
+    updates: list[dict], sender: TelegramSender, users, channels
+) -> int:
     last_update_id = 0
     for update in updates:
         try:
             update_id = int(update.get("update_id") or 0)
             last_update_id = max(last_update_id, update_id)
-            message = update.get("message") or {}
-            chat = message.get("chat") or {}
-            if chat.get("type") != "private":
+            if update.get("callback_query"):
+                _handle_callback(update["callback_query"], sender, users)
                 continue
-            text = (message.get("text") or "").strip()
-            if not text.startswith("/"):
-                continue
-            command = text.split()[0].split("@", 1)[0].lower()
-            chat_id = chat.get("id")
-            if chat_id is None:
-                continue
-
-            if command == "/start":
-                sender.send_message(chat_id, config.start_text(chat_id))
-            elif command == "/help":
-                sender.send_message(chat_id, config.help_text())
+            message = update.get("message")
+            if message:
+                _handle_message(message, sender, users, channels)
         except Exception:
             log.exception("failed to process update")
+    for registry in (users, channels):
+        try:
+            registry.flush()
+        except Exception:
+            log.exception("failed to save registry")
     return last_update_id

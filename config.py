@@ -18,6 +18,8 @@ if load_dotenv is not None:
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 STATE_FILE = DATA_DIR / "state.json"
+USERS_FILE = DATA_DIR / "users.json"
+CHANNELS_FILE = DATA_DIR / "channels.json"
 TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 
 USER_AGENT = (
@@ -78,9 +80,29 @@ def env_chat_id(name: str) -> int | str:
 # Secrets (never logged; validated lazily in main.py)
 # --------------------------------------------------------------------------- #
 TELEGRAM_BOT_TOKEN = env_str("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = env_str("GEMINI_API_KEY")
 ADMIN_CHAT_ID = env_chat_id("ADMIN_CHAT_ID")
 GITHUB_TOKEN = env_str("GITHUB_TOKEN")
+
+
+def _gemini_keys() -> list[str]:
+    """GEMINI_API_KEY_1..3 plus the legacy single GEMINI_API_KEY, deduplicated."""
+    keys: list[str] = []
+    for index in range(1, 4):
+        value = env_str(f"GEMINI_API_KEY_{index}")
+        if value:
+            keys.append(value)
+    legacy = env_str("GEMINI_API_KEY")
+    if legacy:
+        keys.insert(0, legacy)
+    unique: list[str] = []
+    for key in keys:
+        if key not in unique:
+            unique.append(key)
+    return unique
+
+
+GEMINI_API_KEYS = _gemini_keys()
+GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""
 
 
 def _parse_chat_ids(raw: str) -> list[int | str]:
@@ -477,31 +499,125 @@ LISTICLE_PATTERNS = (
 
 
 # --------------------------------------------------------------------------- #
-# Persian user-facing copy
+# Languages, community and rate limiting
 # --------------------------------------------------------------------------- #
-def start_text(chat_id: int | str) -> str:
+SUPPORTED_LANGS = ("fa", "en")
+DEFAULT_LANG = "fa"
+LANG_LABELS = {"fa": "فارسی", "en": "English"}
+
+USER_RATE_WINDOW_SECONDS = env_int("USER_RATE_WINDOW_SECONDS", 60)
+USER_RATE_MAX_MESSAGES = env_int("USER_RATE_MAX_MESSAGES", 3)
+USER_MUTE_SECONDS = env_int("USER_MUTE_SECONDS", 5 * 60)
+STATS_ACTIVE_DAYS = env_int("STATS_ACTIVE_DAYS", 30)
+
+
+# --------------------------------------------------------------------------- #
+# User-facing copy (Persian + English)
+# --------------------------------------------------------------------------- #
+def choose_language_text() -> str:
     return (
-        "🎯 <b>رادار امنیت — هوش تهدید سایبری و امنیت هوش مصنوعی</b>\n\n"
-        "این ربات هر ۴ ساعت جدیدترین تحلیل‌ها و ابزارهای امنیتی را از منابع معتبر "
-        "جمع‌آوری و به فارسی ارسال می‌کند.\n\n"
-        f"<b>Chat ID شما:</b> <code>{chat_id}</code>\n"
-        "برای دریافت خودکار، این آیدی را به ادمین بدهید.\n\n"
-        "دستورها: /help"
+        "🌐 <b>Language / زبان</b>\n\n"
+        "Please choose the language for your summaries.\n"
+        "لطفاً زبان خلاصه‌ها را انتخاب کنید."
     )
 
 
-def help_text() -> str:
+def welcome_text(lang: str, chat_id: int | str) -> str:
+    if lang == "en":
+        return (
+            "🎯 <b>Security Radar — Cyber &amp; AI Security Intelligence</b>\n\n"
+            "Every 4 hours I collect the newest security analysis from trusted "
+            "sources and send it to you.\n\n"
+            f"<b>Your Chat ID:</b> <code>{chat_id}</code>\n"
+            "<b>Language:</b> English\n\n"
+            "Commands: /lang to change language, /help for help."
+        )
+    return (
+        "🎯 <b>رادار امنیت — هوش تهدید سایبری و امنیت هوش مصنوعی</b>\n\n"
+        "این ربات هر ۴ ساعت جدیدترین تحلیل‌ها و ابزارهای امنیتی را از منابع معتبر "
+        "جمع‌آوری و برای شما ارسال می‌کند.\n\n"
+        f"<b>Chat ID شما:</b> <code>{chat_id}</code>\n"
+        "<b>زبان:</b> فارسی\n\n"
+        "دستورها: /lang برای تغییر زبان، /help برای راهنما."
+    )
+
+
+def help_text(lang: str = "fa") -> str:
+    if lang == "en":
+        return (
+            "<b>Bot help</b>\n\n"
+            "/start — register and choose language\n"
+            "/lang — change summary language\n"
+            "/help — this help\n\n"
+            "Summaries are delivered automatically every 4 hours."
+        )
     return (
         "<b>راهنمای ربات</b>\n\n"
-        "/start — نمایش <code>Chat ID</code> شما\n"
-        "/help — همین راهنما\n\n"
+        "/start — ثبت‌نام و انتخاب زبان\n"
+        "/lang — تغییر زبان خلاصه‌ها\n"
+            "/help — همین راهنما\n\n"
         "ارسال تحلیل‌ها به‌صورت خودکار هر ۴ ساعت انجام می‌شود."
     )
 
 
+def join_required_text() -> str:
+    return (
+        "⚠️ <b>برای استفاده از ربات، ابتدا باید در کانال‌های زیر عضو شوید:</b>\n"
+        "<i>To use this bot, please join the channels below first:</i>"
+    )
+
+
+def stats_text(total: int, active: int, days: int = STATS_ACTIVE_DAYS) -> str:
+    return (
+        "📊 <b>آمار ربات:</b>\n\n"
+        f"👥 تعداد کل کاربران (بر اساس /start): <code>{total}</code>\n"
+        f"📅 کاربران فعال {days} روز اخیر: <code>{active}</code>"
+    )
+
+
+def channel_added_text(channel: str) -> str:
+    return f"✅ کانال <code>{channel}</code> به لیست عضویت اجباری اضافه شد."
+
+
+def channel_removed_text(channel: str) -> str:
+    return f"🗑 کانال <code>{channel}</code> از لیست حذف شد."
+
+
+def channel_missing_text(channel: str) -> str:
+    return f"❗️ کانال <code>{channel}</code> در لیست نیست."
+
+
+def channel_usage_text() -> str:
+    return (
+        "استفاده: <code>/addchannel @channelusername</code> یا "
+        "<code>/removechannel @channelusername</code>"
+    )
+
+
+def repo_warning(lang: str) -> str:
+    return REPO_WARNING_EN if lang == "en" else REPO_WARNING
+
+
+def ai_disclaimer(lang: str) -> str:
+    return AI_DISCLAIMER_EN if lang == "en" else AI_DISCLAIMER
+
+
+def ai_disclaimer_no_ai(lang: str) -> str:
+    return AI_DISCLAIMER_NO_AI_EN if lang == "en" else AI_DISCLAIMER_NO_AI
+
+
+def source_link_text(lang: str) -> str:
+    return "Read the full source" if lang == "en" else "مطالعه کامل منبع"
+
+
 REPO_WARNING = "⚠️ <b>بررسی‌نشده:</b> ریپوی تازه‌ساز. قبل از اجرا کد را بخوانید."
+REPO_WARNING_EN = (
+    "⚠️ <b>Unreviewed:</b> freshly created repository. Read the code before running it."
+)
 AI_DISCLAIMER = "خلاصه با AI تولید شده — منبع اصلی را بررسی کنید."
+AI_DISCLAIMER_EN = "AI-generated summary — verify the original source."
 AI_DISCLAIMER_NO_AI = "خلاصه خودکار (بدون AI) — منبع اصلی را بررسی کنید."
+AI_DISCLAIMER_NO_AI_EN = "Automatic summary (no AI) — verify the original source."
 QUOTA_NOTICE = (
     "⚠️ سهمیه روزانه <code>Gemini</code> تمام شد؛ در این اجرا خلاصه‌های ساده "
     "(عنوان + لینک) ارسال شد."

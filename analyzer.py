@@ -87,6 +87,80 @@ HARD RULES:
    Avoid vague AI hype."""
 
 
+SUMMARIZE_SYSTEM_PROMPT_EN = """You are a Senior Cybersecurity & Bug Bounty Analyst with a second
+specialization in AI/LLM Security. You write for an English-speaking audience
+of professional bug bounty hunters, penetration testers, and AI red teamers.
+
+You will receive: TITLE, SOURCE, URL, and the FULL TEXT of an article,
+advisory, or repository README.
+
+DECISION:
+If the content is low-value, promotional, a beginner listicle ("Top 10 tools"),
+a generic career/marketing post, paywalled with no substantive text, or not
+technically about security or AI security, output exactly:
+SKIP
+Nothing else. No explanation, no punctuation, no quotes.
+
+Valuable content includes: real vulnerability write-ups, novel WAF/filter
+bypass techniques, CVE and zero-day analysis, exploit chains, bug bounty
+methodology with concrete payloads, and new offensive/defensive security or
+AI-security tooling.
+
+LANGUAGE:
+Write in fluent, natural, professional technical English.
+Keep ALL technical terms in English and wrap each in <code> tags:
+<code>XSS</code>, <code>SSRF</code>, <code>IDOR</code>, <code>RCE</code>,
+<code>SQLi</code>, <code>SSTI</code>, <code>WAF Bypass</code>,
+<code>Payload</code>, <code>Prompt Injection</code>, <code>Jailbreak</code>,
+<code>MCP</code>, <code>RAG Poisoning</code>, <code>CVE-2026-1234</code>.
+
+OUTPUT FORMAT — Telegram HTML ONLY:
+Allowed tags: <b>, <i>, <code>, <pre>, <a href="...">, <blockquote>
+FORBIDDEN: <br>, <p>, <ul>, <li>, <h1>-<h6>, <div>, <span>, Markdown (** ## -).
+Use real newlines for line breaks, never <br>.
+Escape & < > inside text content. Never leave a tag unclosed.
+Total output MUST be under 900 characters.
+
+Exact structure:
+
+🔴 <b>[catchy English title]</b>
+📂 <b>Category:</b> [category] | <b>Source:</b> [source name]
+
+<b>🔍 Technical scenario:</b>
+[2-3 English sentences: how the bug actually worked, or what the tool actually
+does. Be concrete — name the endpoint, parameter, component, or model behavior.]
+
+<b>💡 Key takeaway:</b>
+[1-2 English sentences: the bypass technique, exploitation vector, or the
+practical takeaway a hunter can reuse. Include the actual payload or command
+in <code> if one is present in the source.]
+
+🔗 <a href="[URL]">Read the full source</a>
+<i>AI-generated summary — verify the original source.</i>
+
+HARD RULES:
+1. NEVER invent a CVE ID, affected version, CVSS score, vendor name, or payload
+   that does not literally appear in the provided text. If a detail is missing,
+   omit it. Do not guess. Accuracy over completeness.
+2. If the item is a GitHub repository (especially one created in the last 7 days
+   claiming to be a PoC or exploit), append this exact line before the link:
+   ⚠️ <b>Unreviewed:</b> freshly created repository. Read the code before running it.
+3. Use the URL exactly as provided. Never fabricate or shorten a link.
+4. No preamble, no "here is the summary", no closing remarks. Output only the
+   formatted message, or only SKIP.
+5. Do not reproduce more than a short payload snippet from the source.
+   Summarize in your own words; this must be a transformative summary.
+6. For AI-security items, be specific about the attack surface: direct vs
+   indirect <code>Prompt Injection</code>, tool/agent abuse, <code>MCP</code>
+   server trust boundaries, model supply chain, or guardrail bypass.
+   Avoid vague AI hype."""
+
+SUMMARIZE_PROMPTS = {
+    "fa": SUMMARIZE_SYSTEM_PROMPT,
+    "en": SUMMARIZE_SYSTEM_PROMPT_EN,
+}
+
+
 TRIAGE_SYSTEM_PROMPT = """You are a Senior Cybersecurity & AI Security Analyst triaging a candidate list.
 
 You receive a JSON array: [{"id": 0, "title": "...", "source": "..."}, ...]
@@ -216,7 +290,25 @@ def _retry_delay(exc: Exception) -> float | None:
     return None
 
 
-def fallback_summary(item: Item, note: str | None = None) -> str:
+def _is_quota_error(exc: Exception) -> bool:
+    if _status_code(exc) == 429:
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in ("resource_exhausted", "quota", "rate limit", "too many requests")
+    )
+
+
+def _is_daily_quota(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "per day" in text or "daily" in text
+
+
+def fallback_summary(
+    item: Item, lang: str = "fa", note: str | None = None
+) -> str:
+    lang = "en" if lang == "en" else "fa"
     title = html.escape(item.title)
     category = item.category or (
         "AI Security" if item.ai_related else "Classic Security"
@@ -224,6 +316,19 @@ def fallback_summary(item: Item, note: str | None = None) -> str:
     source = html.escape(item.source_label)
     snippet = html.escape((item.summary or item.content or "")[:280].strip())
     link = html.escape(item.url, quote=True)
+    if lang == "en":
+        lines = [
+            f"🔴 <b>{title}</b>",
+            f"📂 <b>Category:</b> {category} | <b>Source:</b> {source}",
+            "",
+        ]
+        if snippet:
+            lines.extend(["<b>🔍 Summary:</b>", snippet, ""])
+        if item.is_repo:
+            lines.extend([config.repo_warning(lang), ""])
+        lines.append(f'🔗 <a href="{link}">{config.source_link_text(lang)}</a>')
+        lines.append(f"<i>{html.escape(note or config.ai_disclaimer_no_ai(lang))}</i>")
+        return "\n".join(lines)
     lines = [
         f"🔴 <b>{title}</b>",
         f"📂 <b>دسته:</b> {category} | <b>منبع:</b> {source}",
@@ -232,15 +337,22 @@ def fallback_summary(item: Item, note: str | None = None) -> str:
     if snippet:
         lines.extend([f"<b>🔍 خلاصه:</b>", snippet, ""])
     if item.is_repo:
-        lines.extend([config.REPO_WARNING, ""])
-    lines.append(f'🔗 <a href="{link}">مطالعه کامل منبع</a>')
-    lines.append(f"<i>{html.escape(note or config.AI_DISCLAIMER_NO_AI)}</i>")
+        lines.extend([config.repo_warning(lang), ""])
+    lines.append(f'🔗 <a href="{link}">{config.source_link_text(lang)}</a>')
+    lines.append(f"<i>{html.escape(note or config.ai_disclaimer_no_ai(lang))}</i>")
     return "\n".join(lines)
 
 
 class Analyzer:
-    def __init__(self, api_key: str, budget: AIBudget, model: str | None = None):
-        if not api_key:
+    def __init__(
+        self,
+        api_keys: list[str] | str,
+        budget: AIBudget,
+        model: str | None = None,
+    ):
+        keys = [api_keys] if isinstance(api_keys, str) else list(api_keys or [])
+        self._keys = [key for key in keys if key]
+        if not self._keys:
             raise AnalyzerError("GEMINI_API_KEY is missing")
         try:
             from google import genai
@@ -249,10 +361,33 @@ class Analyzer:
             raise AnalyzerError(
                 "google-genai is not installed; run pip install -r requirements.txt"
             ) from exc
+        self._genai = genai
         self._types = types
-        self._client = genai.Client(api_key=api_key)
+        self._clients: dict[int, object] = {}
+        self._exhausted: set[int] = set()
+        self._active = 0
         self.model = model or config.GEMINI_MODEL
         self.budget = budget
+
+    @property
+    def key_count(self) -> int:
+        return len(self._keys)
+
+    def _client(self, index: int):
+        client = self._clients.get(index)
+        if client is None:
+            client = self._genai.Client(api_key=self._keys[index])
+            self._clients[index] = client
+        return client
+
+    def _next_key(self) -> int | None:
+        total = len(self._keys)
+        for offset in range(total):
+            index = (self._active + offset) % total
+            if index not in self._exhausted:
+                self._active = index
+                return index
+        return None
 
     # ------------------------------------------------------------------ #
     def _generate(
@@ -265,12 +400,18 @@ class Analyzer:
         max_output_tokens: int | None = None,
     ) -> str:
         last_error: Exception | None = None
-        for attempt in range(1, config.AI_MAX_RETRIES + 1):
+        attempts = 0
+        max_attempts = config.AI_MAX_RETRIES + len(self._keys)
+        while attempts < max_attempts:
+            index = self._next_key()
+            if index is None:
+                break
             if not self.budget.can_call():
                 raise BudgetExhausted("AI budget exhausted")
             self.budget.mark()
+            attempts += 1
             try:
-                response = self._client.models.generate_content(
+                response = self._client(index).models.generate_content(
                     model=self.model,
                     contents=contents,
                     config=self._types.GenerateContentConfig(
@@ -284,26 +425,56 @@ class Analyzer:
             except Exception as exc:  # google.genai raises APIError subclasses
                 last_error = exc
                 code = _status_code(exc)
-                retryable = code in (429, 500, 502, 503, 504)
-                if not retryable or attempt >= config.AI_MAX_RETRIES:
+                if _is_quota_error(exc):
+                    if (
+                        len(self._keys) == 1
+                        and not _is_daily_quota(exc)
+                        and attempts < config.AI_MAX_RETRIES
+                    ):
+                        delay = _retry_delay(exc) or min(
+                            60.0,
+                            config.AI_BACKOFF_BASE
+                            * attempts
+                            * (1 + random.random() * 0.5),
+                        )
+                        log.warning(
+                            "gemini rate limited key=%d attempt=%d delay=%.1fs",
+                            index + 1,
+                            attempts,
+                            delay,
+                        )
+                        time.sleep(delay)
+                        continue
+                    self._exhausted.add(index)
                     log.warning(
-                        "gemini failed attempt=%d code=%s err=%s",
-                        attempt,
+                        "gemini key exhausted key=%d/%d code=%s",
+                        index + 1,
+                        len(self._keys),
                         code,
-                        exc.__class__.__name__,
                     )
-                    break
-                delay = _retry_delay(exc) or min(
-                    60.0,
-                    config.AI_BACKOFF_BASE ** attempt * (1 + random.random() * 0.5),
-                )
+                    continue
+                if code in (500, 502, 503, 504) and attempts < max_attempts:
+                    delay = _retry_delay(exc) or min(
+                        60.0,
+                        config.AI_BACKOFF_BASE * attempts * (1 + random.random() * 0.5),
+                    )
+                    log.warning(
+                        "gemini retry attempt=%d code=%s delay=%.1fs",
+                        attempts,
+                        code,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
                 log.warning(
-                    "gemini retry attempt=%d code=%s delay=%.1fs",
-                    attempt,
+                    "gemini failed attempt=%d code=%s err=%s",
+                    attempts,
                     code,
-                    delay,
+                    exc.__class__.__name__,
                 )
-                time.sleep(delay)
+                break
+        if last_error is None:
+            raise AnalyzerError("all Gemini API keys are exhausted")
         raise AnalyzerError(f"gemini call failed: {last_error}")
 
     # ------------------------------------------------------------------ #
@@ -353,9 +524,10 @@ class Analyzer:
         return [item for _, item in scored][: config.MAX_ITEMS_PER_RUN]
 
     # ------------------------------------------------------------------ #
-    def summarize(self, item: Item) -> SummaryResult:
+    def summarize(self, item: Item, lang: str = "fa") -> SummaryResult:
+        lang = "en" if lang == "en" else "fa"
         if len((item.content or "").strip()) < 60:
-            return SummaryResult("error", fallback_summary(item))
+            return SummaryResult("error", fallback_summary(item, lang))
         contents = (
             f"TITLE: {item.title}\n"
             f"SOURCE: {item.source_label}\n"
@@ -365,15 +537,15 @@ class Analyzer:
         try:
             raw = self._generate(
                 contents,
-                system=SUMMARIZE_SYSTEM_PROMPT,
+                system=SUMMARIZE_PROMPTS[lang],
                 temperature=config.SUMMARY_TEMPERATURE,
                 max_output_tokens=config.AI_MAX_OUTPUT_TOKENS,
             )
         except BudgetExhausted:
-            return SummaryResult("quota", fallback_summary(item))
+            return SummaryResult("quota", fallback_summary(item, lang))
         except AnalyzerError as exc:
             log.warning("summary failed source=%s err=%s", item.source_label, exc)
-            return SummaryResult("error", fallback_summary(item))
+            return SummaryResult("error", fallback_summary(item, lang))
 
         cleaned = (raw or "").strip()
         cleaned = re.sub(r"^```(?:html)?", "", cleaned, flags=re.IGNORECASE).strip()
@@ -383,22 +555,27 @@ class Analyzer:
             return SummaryResult("skip", "")
         if not cleaned:
             log.warning("summary empty source=%s", item.source_label)
-            return SummaryResult("error", fallback_summary(item))
-        return SummaryResult("ok", self._postprocess(item, cleaned))
+            return SummaryResult("error", fallback_summary(item, lang))
+        return SummaryResult("ok", self._postprocess(item, cleaned, lang))
 
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _postprocess(item: Item, text: str) -> str:
+    def _postprocess(item: Item, text: str, lang: str = "fa") -> str:
         if len(text) > 3900:
             cut = text.rfind("\n", 0, 3900)
             text = text[: cut if cut > 2000 else 3900].rstrip()
-        if item.is_repo and "بررسی‌نشده" not in text:
-            text += f"\n\n{config.REPO_WARNING}"
+        warning = config.repo_warning(lang)
+        if item.is_repo and ("بررسی‌نشده" not in text and "Unreviewed" not in text):
+            text += f"\n\n{warning}"
         if item.url and item.url not in text:
             link = html.escape(item.url, quote=True)
-            text += f'\n\n🔗 <a href="{link}">مطالعه کامل منبع</a>'
-        if "منبع اصلی را بررسی کنید" not in text:
-            text += f"\n<i>{config.AI_DISCLAIMER}</i>"
+            text += (
+                f'\n\n🔗 <a href="{link}">{config.source_link_text(lang)}</a>'
+            )
+        disclaimer = config.ai_disclaimer(lang)
+        if disclaimer not in text and "منبع اصلی را بررسی کنید" not in text:
+            if "verify the original source" not in text:
+                text += f"\n<i>{disclaimer}</i>"
         return text.strip()
 
 

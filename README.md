@@ -3,9 +3,12 @@
 ربات کاملاً رایگان و سرورلس که هر ۴ ساعت جدیدترین تحلیل‌های **امنیت سایبری** و **AI Security** را از منابع معتبر جمع‌آوری می‌کند، با `Gemini` به فارسی خلاصه می‌کند و در تلگرام به شما می‌فرستد.
 
 - اجرا روی **GitHub Actions** (بدون سرور، بدون هزینه)
-- **بدون دیتابیس و بدون Google Sheets** — فقط یک فایل `data/state.json` که خود Workflow کامیت می‌کند
-- هوش مصنوعی: **Google Gemini** (`gemini-2.5-flash`، قابل تغییر)
+- **بدون دیتابیس و بدون Google Sheets** — فقط فایل‌های JSON داخل `data/` که خود Workflow کامیت می‌کند
+- هوش مصنوعی: **Google Gemini** (`gemini-2.5-flash`، قابل تغییر) با **تا ۳ کلید** و چرخش خودکار روی سهمیه
 - تحویل: **Telegram Bot API** با HTML امن‌شده و پیام‌های حداکثر ۴۰۹۶ کاراکتری
+- **دو زبانه**: فارسی و English — کاربر با `/start` یا `/lang` زبانش را انتخاب می‌کند
+- **آمار کاربران** با `/stats` (فقط ادمین) و **عضویت اجباری در کانال** با `/addchannel`
+- **ضد اسپم**: حداکثر ۳ پیام در دقیقه؛ بیشتر از آن، ۵ دقیقه نادیده گرفته می‌شود
 
 ---
 
@@ -38,15 +41,19 @@ GitHub Actions (هر ۴ ساعت)
 
 ```
 .
-├── config.py                    # منابع، کلیدواژه‌ها، وزن‌ها، بودجه‌ها، متن‌های فارسی
+├── config.py                    # منابع، کلیدواژه‌ها، وزن‌ها، بودجه‌ها، متن‌های فارسی/انگلیسی
 ├── fetcher.py                   # ۹ منبع + استخراج متن کامل + README ریپوها
 ├── filter.py                    # Stage 1: dedup، فیلتر، امتیازدهی
-├── analyzer.py                  # پرامپت‌های Gemini، triage، summarize، backoff
+├── analyzer.py                  # پرامپت‌های Gemini (fa/en)، triage، summarize، چرخش کلید
 ├── store.py                     # state.json: dedup، شمارنده AI، offset آپدیت‌ها
-├── telegram_sender.py           # getUpdates، sanitizer، splitter، retry
+├── users_store.py               # users.json: زبان، پروفایل، آمار، rate limit
+├── channels_store.py            # channels.json: کانال‌های عضویت اجباری
+├── telegram_sender.py           # getUpdates، دستورها، کیبورد، sanitizer، retry
 ├── pdf_report.py                # PDF فارسی روزانه (اختیاری)
-├── main.py                      # هماهنگی، تایم‌زون تهران، مسیریابی تحویل
+├── main.py                      # هماهنگی، تایم‌زون تهران، تحویل چندزبانه
 ├── data/state.json              # وضعیت پایدار (خودکار کامیت می‌شود)
+├── data/users.json              # کاربران و زبان‌ها (خودکار ساخته/کامیت می‌شود)
+├── data/channels.json           # کانال‌های عضویت اجباری (خودکار ساخته/کامیت می‌شود)
 ├── requirements.txt
 ├── .github/workflows/bot_runner.yml
 ├── assets/fonts/                # فونت وزیرمتن برای PDF
@@ -106,6 +113,12 @@ Google Sheets، پروژه Google Cloud و Service Account **لازم نیست**
 
 اگر مدل پیش‌فرض در دسترس نبود، یک متغیر Repository به نام `GEMINI_MODEL` بسازید و نام مدل موجود در AI Studio را بگذارید.
 
+### چند کلید (اختیاری ولی توصیه‌شده)
+
+می‌توانید تا سه کلید بسازید و به ترتیب در Secretهای `GEMINI_API_KEY_1`، `GEMINI_API_KEY_2` و `GEMINI_API_KEY_3` بگذارید. وقتی یک کلید به سهمیه/نرخ (429) بخورد، ربات خودکار سراغ کلید بعدی می‌رود و در همان اجرا متوقف نمی‌شود. اگر همه کلیدها تمام شوند، خلاصه ساده «عنوان + لینک» ارسال می‌شود.
+
+`GEMINI_API_KEY` (تک‌کلید قبلی) هم هنوز کار می‌کند و اگر هر دو تنظیم شوند، اولویت با آن است.
+
 ---
 
 ## ۶) مرحله ۳ — GitHub و Secrets
@@ -117,11 +130,29 @@ Google Sheets، پروژه Google Cloud و Service Account **لازم نیست**
 | نام Secret | مقدار | استفاده |
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | توکن BotFather | ارسال پیام |
-| `GEMINI_API_KEY` | کلید AI Studio | خلاصه‌سازی |
-| `TELEGRAM_CHAT_IDS` | آیدی‌های عددی با کاما، و/یا `@channel` | همه گیرنده‌های خلاصه |
-| `ADMIN_CHAT_ID` | آیدی عددی خودتان (اختیاری) | گزارش خطا، اگر در `TELEGRAM_CHAT_IDS` نبود |
+| `GEMINI_API_KEY` | کلید AI Studio (یا `GEMINI_API_KEY_1..3`) | خلاصه‌سازی |
+| `TELEGRAM_CHAT_IDS` | آیدی‌های عددی با کاما، و/یا `@channel` | گیرنده‌های همیشگی خلاصه |
+| `ADMIN_CHAT_ID` | آیدی عددی خودتان (اختیاری) | `/stats`، `/addchannel`، گزارش خطا |
+
+| نام Secret (اختیاری) | مقدار |
+|---|---|
+| `GEMINI_API_KEY_1` | کلید اول |
+| `GEMINI_API_KEY_2` | کلید دوم |
+| `GEMINI_API_KEY_3` | کلید سوم |
 
 > `GITHUB_TOKEN` را نسازید؛ GitHub آن را خودکار در اختیار Workflow می‌گذارد.
+
+### فایل‌های داده
+
+ربات سه فایل JSON دارد و **همه را خودش می‌سازد**؛ نیازی به ساخت دستی نیست:
+
+| فایل | محتوا | چه‌وقت ساخته می‌شود |
+|---|---|---|
+| `data/state.json` | هش لینک‌های ارسال‌شده، شمارنده AI، offset آپدیت‌ها | اولین اجرا |
+| `data/users.json` | `chat_id` → نام، یوزرنیم، تاریخ عضویت، آخرین فعالیت، زبان | اولین `/start` |
+| `data/channels.json` | لیست کانال‌های عضویت اجباری | اولین `/addchannel` |
+
+در این پروژه دو فایل `data/users.json` (مقدار `{}`) و `data/channels.json` (مقدار `[]`) از قبل قرار داده شده‌اند تا اولین کامیت Workflow مشکلی نداشته باشد. Workflow در هر اجرا هر سه فایل را (اگر تغییر کرده باشند) با پیام `chore: update bot state [skip ci]` کامیت می‌کند.
 
 4. اگر PDF می‌خواهید، در تب `Variables` یک متغیر به نام `ENABLE_PDF` با مقدار `true` بسازید. (بخش ۹)
 
@@ -150,7 +181,7 @@ Workflow باید `data/state.json` را بعد از هر اجرا کامیت ک
    - `candidate score=...`
    - خلاصه‌ها در بخش `DRY RUN PREVIEW`
 
-در حالت dry-run هیچ پیامی ارسال نمی‌شود و `state.json` تغییر نمی‌کند. اگر خروجی درست بود، `/start` را به ربات بفرستید، آیدی را در `TELEGRAM_CHAT_IDS` بگذارید و بعد Workflow را بدون dry-run اجرا کنید.
+در حالت dry-run هیچ پیامی ارسال نمی‌شود و هیچ‌کدام از فایل‌های `data/state.json`، `data/users.json` و `data/channels.json` تغییر نمی‌کنند. اگر خروجی درست بود، `/start` را به ربات بفرستید، آیدی را در `TELEGRAM_CHAT_IDS` بگذارید و بعد Workflow را بدون dry-run اجرا کنید.
 
 ---
 
@@ -190,12 +221,20 @@ Workflow با cron زیر هر ۴ ساعت اجرا می‌شود:
 
 ## ۱۰) دستورهای ربات
 
-| دستور | کار |
-|---|---|
-| `/start` | نمایش `Chat ID` شما برای دریافت خودکار |
-| `/help` | راهنما |
+| دستور | چه کسی | کار |
+|---|---|---|
+| `/start` | همه | ثبت‌نام، نمایش کیبورد انتخاب زبان (فارسی / English) و `Chat ID` |
+| `/lang` | همه | تغییر زبان در هر زمان |
+| `/help` | همه | راهنما به زبان انتخاب‌شده |
+| `/stats` | فقط ادمین | `📊 آمار ربات:` + تعداد کل کاربران + کاربران فعال ۳۰ روز اخیر |
+| `/addchannel @channel` | فقط ادمین | افزودن کانال به لیست عضویت اجباری |
+| `/removechannel @channel` | فقط ادمین | حذف کانال از لیست |
 
-ارسال خلاصه‌ها خودکار و هر ۴ ساعت انجام می‌شود؛ دیتابیس کاربری وجود ندارد.
+- **ادمین** کسی است که `chat_id` او با Secret `ADMIN_CHAT_ID` برابر باشد. دستورهای ادمین برای بقیه کاملاً نادیده گرفته می‌شوند.
+- **زبان** در `data/users.json` ذخیره می‌شود و همه خلاصه‌های بعدی برای همان کاربر به همان زبان ساخته می‌شوند. کاربری که هنوز زبان انتخاب نکرده، فارسی می‌گیرد.
+- **عضویت اجباری**: اگر `data/channels.json` خالی نباشد، ربات قبل از هر دستور (به‌جز برای ادمین) با `getChatMember` عضویت کاربر را چک می‌کند. اگر عضو نباشد، پیام «⚠️ برای استفاده از ربات، ابتدا باید در کانال‌های زیر عضو شوید:» با دکمه‌های لینک کانال می‌فرستد. **ربات باید در هر کانال ادمین باشد**؛ اگر نباشد بررسی آن کانال با یک هشدار در لاگ رد می‌شود تا کاربر قفل نشود.
+- **ضد اسپم**: بیش از ۳ پیام در هر ۶۰ ثانیه باعث می‌شود پیام‌های آن کاربر تا ۵ دقیقه نادیده گرفته شود. بین ارسال پیام‌ها ۵۰ میلی‌ثانیه فاصله است و روی خطای 429 مقدار `Retry-After` رعایت می‌شود.
+- **دریافت خودکار**: هر کسی که `/start` بزند به گیرنده‌های ارسال اضافه می‌شود؛ ارسال خودکار هر ۴ ساعت انجام می‌شود.
 
 ---
 
@@ -205,9 +244,9 @@ Workflow با cron زیر هر ۴ ساعت اجرا می‌شود:
 |---|---|
 | منبع جدید اضافه کنم | `config.py` → `RSS_SECURITY_FEEDS` / `RSS_AI_FEEDS` / `GITHUB_KEYWORDS` / `HN_QUERIES` |
 | وزن منابع یا کلیدواژه‌ها را عوض کنم | `config.py` → `SOURCE_WEIGHTS` / `KEYWORD_WEIGHTS` |
-| پرامپت خلاصه یا Triage را تغییر دهم | `analyzer.py` → `SUMMARIZE_SYSTEM_PROMPT` / `TRIAGE_SYSTEM_PROMPT` |
-| متن خوش‌آمد یا راهنما را عوض کنم | `config.py` → `start_text()` / `help_text()` |
-| گیرنده‌ها را عوض کنم | Secret `TELEGRAM_CHAT_IDS` |
+| پرامپت خلاصه یا Triage را تغییر دهم | `analyzer.py` → `SUMMARIZE_SYSTEM_PROMPT(_EN)` / `TRIAGE_SYSTEM_PROMPT` |
+| متن خوش‌آمد، راهنما یا انتخاب زبان را عوض کنم | `config.py` → `welcome_text()` / `help_text()` / `choose_language_text()` |
+| گیرنده‌ها را عوض کنم | Secret `TELEGRAM_CHAT_IDS` (کاربران `/start` خودکار اضافه می‌شوند) |
 | تعداد خلاصه در هر اجرا | `MAX_ITEMS_PER_RUN` (پیش‌فرض ۱۰) |
 | سقف فراخوانی AI | `MAX_AI_CALLS_PER_RUN` / `DAILY_AI_BUDGET` |
 | فاصله اجرا | cron در `.github/workflows/bot_runner.yml` |
@@ -215,6 +254,9 @@ Workflow با cron زیر هر ۴ ساعت اجرا می‌شود:
 | تعداد روز نگهداری dedup | `SENT_LOG_RETENTION_DAYS` (پیش‌فرض ۱۴) |
 | آستانه پذیرش Triage | `TRIAGE_THRESHOLD` (پیش‌فرض ۷ از ۱۰) |
 | مدل Gemini | متغیر `GEMINI_MODEL` |
+| تعداد کلیدهای Gemini | `config.py` → `_gemini_keys()` (پیش‌فرض ۳ عدد: `GEMINI_API_KEY_1..3`) |
+| سقف پیام و مدت سکوت ضد اسپم | `USER_RATE_MAX_MESSAGES` / `USER_RATE_WINDOW_SECONDS` / `USER_MUTE_SECONDS` |
+| بازه «کاربر فعال» در آمار | `STATS_ACTIVE_DAYS` (پیش‌فرض ۳۰) |
 | خاموش کردن یک منبع | متغیرهای `ENABLE_*` (مثلاً `ENABLE_REDDIT=false`) |
 | سرورهای Mastodon | متغیر `MASTODON_HOSTS` (لیست جدا با کاما؛ پیش‌فرض `infosec.town,mastodon.social`) |
 | سقف هر منبع در لیست کاندیدها | `MAX_PER_SOURCE_CANDIDATES` (پیش‌فرض ۶) |
@@ -266,6 +308,11 @@ python main.py
 | Bluesky یا Mastodon خالی است | API عمومی تغییر کرده یا IP محدود شده | Mastodon را با متغیر `MASTODON_HOSTS` روی سرور دیگری بگذارید؛ Bluesky از `api.bsky.app` استفاده می‌کند |
 | PDF ساخته نمی‌شود | فونت یا کتابخانه سیستمی نیست | فونت‌ها را در `assets/fonts` بگذارید و `ENABLE_PDF=true` کنید |
 | Workflow اجرا نمی‌شود | زمان‌بندی غیرفعال شده | یک `Run workflow` دستی بزنید (بعد از ۶۰ روز بی‌فعالیتی) |
+| کاربر جدید در آمار نیست | `users.json` کامیت نشده یا کاربر `/start` نزده | بخش ۶ را چک کنید؛ لاگ `users saved` و `user registered` را ببینید |
+| `/stats` جواب نمی‌دهد | `ADMIN_CHAT_ID` تنظیم نشده یا با آیدی شما فرق دارد | Secret را با آیدی عددی خودتان پر کنید |
+| `/addchannel` کار نمی‌کند | ربات در کانال ادمین نیست | ربات را با دسترسی **Post Messages** ادمین کانال کنید؛ لاگ `join check skipped` را ببینید |
+| کاربر واقعاً عضو کانال است ولی مسدود می‌شود | آیدی کانال اشتباه است | آیدی را با `@` و یوزرنیم دقیق بدهید (`/addchannel @mychannel`) |
+| کاربر بعد از چند پیام جواب نمی‌گیرد | ضد اسپم فعال شده | طبیعی است؛ بعد از ۵ دقیقه خودکار آزاد می‌شود |
 
 ---
 
@@ -292,3 +339,43 @@ python main.py
 ## ۱۶) مجوز و مسئولیت
 
 این پروژه برای پایش دفاعی و آموزشی ساخته شده است. استفاده از payloadها و ابزارهای ذکرشده فقط در محیط‌های مجاز و با اجازه کتبی قانونی است. مسئولیت استفاده بر عهده کاربر است.
+
+---
+
+## ۱۷) به‌روزرسانی کد و استقرار (Git)
+
+هر تغییری در کد یا README فقط بعد از push به GitHub روی ربات اعمال می‌شود؛ GitHub Actions نسخه‌ی داخل ریپازیتوری را اجرا می‌کند.
+
+```bash
+git status
+git add .
+git commit -m "feat: add language selection, multi-api keys, user stats, admin channel management, rate limit"
+git push
+```
+
+- در ویندوز همین دستورها را در PowerShell یا Git Bash داخل پوشه پروژه بزنید.
+- اگر اولین push به شاخه `main` است، ممکن است GitHub نیاز به تنظیم upstream داشته باشد: `git push -u origin main`.
+- قبل از push مطمئن شوید `.env` کامیت نمی‌شود (در `.gitignore` هست).
+- `data/users.json` و `data/channels.json` **نیازی به ساخت دستی ندارند**؛ نسخه‌ی خالی‌شان در ریپو هست و ربات خودش پرشان می‌کند. فایل‌های `data/*.json` را دستی commit نکنید — Workflow خودش آن‌ها را کامیت می‌کند.
+- بعد از push، از تب **Actions** می‌توانید `Run workflow` را بزنید تا بدون انتظار برای cron اجرا شود.
+
+---
+
+## ۱۸) عکس و بیوی ربات در BotFather
+
+عکس پروفایل و متن معرفی از داخل کد قابل تنظیم نیستند و فقط در BotFather تغییر می‌کنند:
+
+1. در تلگرام به [@BotFather](https://t.me/BotFather) پیام دهید.
+2. `/mybots` → ربات خودتان را انتخاب کنید.
+3. **Edit Bot** → **Edit Botpic**: یک عکس مربعی (حداقل ۳۲۰×۳۲۰) بفرستید.
+4. **Edit Bot** → **Edit About**: یک متن کوتاه (حدود ۱۲۰ کاراکتر) برای صفحه‌ی ربات بگذارید.
+5. **Edit Bot** → **Edit Description**: توضیح بلندتری که قبل از `/start` دیده می‌شود.
+6. اختیاری: **Edit Commands** → این لیست را ثبت کنید تا کاربر با `/` ببیند:
+
+```text
+start - شروع و انتخاب زبان
+lang - تغییر زبان
+help - راهنما
+```
+
+دستورهای `/stats`، `/addchannel` و `/removechannel` را در لیست عمومی نگذارید؛ مخفی و مخصوص ادمین هستند.
