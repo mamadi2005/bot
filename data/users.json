@@ -3,18 +3,18 @@
     "first_name": "Mohammad",
     "join_date": "2026-11-18T05:24:53+03:30",
     "lang": "",
-    "last_seen": "2026-11-18T15:52:49+03:30",
-    "msg_count": 0,
-    "muted_until": "2026-11-18T15:57:50+03:30",
+    "last_seen": "2026-11-19T20:22:05+03:30",
+    "msg_count": 1,
+    "msg_window_start": "2026-11-19T20:22:05+03:30",
     "username": "Mamadi_84"
   },
   "8848337052": {
     "first_name": "Moh",
     "join_date": "2026-11-18T01:25:42+03:30",
     "lang": "",
-    "last_seen": "2026-11-18T01:25:42+03:30",
+    "last_seen": "2026-11-19T20:22:05+03:30",
     "msg_count": 1,
-    "msg_window_start": "2026-11-18T01:25:42+03:30",
+    "msg_window_start": "2026-11-19T20:22:05+03:30",
     "username": ""
   }
 }
