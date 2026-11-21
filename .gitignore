@@ -1,7 +1,12 @@
 .env
+.tgcloud/
+node_modules/
 .venv*/
 venv/
 __pycache__/
+data/*.db
+data/*.db-wal
+data/*.db-shm
 *.py[cod]
 build/
 *.pdf

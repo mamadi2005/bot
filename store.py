@@ -38,12 +38,17 @@ class BaseStore:
         self.sent: dict[str, str] = {}
         self.sent_hashes: set[str] = set()
         self._dirty = False
+        self.news_messages: list[dict] = []
+        self._extra: dict = {}
 
     def load(self) -> None:
         return None
 
     def flush(self) -> None:
         self._dirty = False
+
+    def _save_news(self) -> None:
+        return None
 
     def get_state(self, key: str, default: str = "") -> str:
         return self.state.get(key, default)
@@ -54,6 +59,27 @@ class BaseStore:
             return
         self.state[key] = value
         self._dirty = True
+
+    def record_news_message(
+        self, chat_id: int | str, message_id: int, sent_at: datetime
+    ) -> None:
+        entry = {
+            "chat_id": chat_id, "message_id": message_id, "sent_at": sent_at.isoformat()
+        }
+        self.news_messages.append(entry)
+        try:
+            self._save_news()
+        except Exception:
+            self.news_messages.remove(entry)
+            raise
+
+    def remove_news_message(self, entry: dict) -> None:
+        self.news_messages.remove(entry)
+        try:
+            self._save_news()
+        except Exception:
+            self.news_messages.append(entry)
+            raise
 
     def log_sent(
         self,
@@ -79,8 +105,19 @@ class JsonStore(BaseStore):
     def __init__(self, path: Path) -> None:
         super().__init__()
         self.path = Path(path)
+        self.news_path = self.path.with_name("news_messages.json")
 
     def load(self) -> None:
+        if self.news_path.exists():
+            try:
+                messages = json.loads(self.news_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise StoreError(
+                    f"cannot read {self.news_path.name}: {exc.__class__.__name__}"
+                ) from exc
+            if not isinstance(messages, list):
+                raise StoreError(f"{self.news_path.name} must contain a JSON array")
+            self.news_messages = messages
         if not self.path.exists():
             return
         try:
@@ -91,6 +128,11 @@ class JsonStore(BaseStore):
             ) from exc
         if not isinstance(data, dict):
             raise StoreError(f"{self.path.name} must contain a JSON object")
+
+        self._extra = {
+            key: value for key, value in data.items()
+            if key not in {"version", "updated_at", "state", "sent"}
+        }
 
         state = data.get("state")
         if isinstance(state, dict):
@@ -113,10 +155,23 @@ class JsonStore(BaseStore):
             "state loaded keys=%d sent=%d", len(self.state), len(self.sent)
         )
 
+    def _save_news(self) -> None:
+        text = json.dumps(self.news_messages, ensure_ascii=False, separators=(",", ":"))
+        try:
+            self.news_path.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.news_path.with_suffix(".json.tmp")
+            temp.write_text(text, encoding="utf-8")
+            os.replace(temp, self.news_path)
+        except OSError as exc:
+            raise StoreError(
+                f"cannot write {self.news_path.name}: {exc.__class__.__name__}"
+            ) from exc
+
     def flush(self) -> None:
         if not self._dirty:
             return
         payload = {
+            **self._extra,
             "version": 1,
             "updated_at": datetime.now(config.TEHRAN_TZ).isoformat(timespec="seconds"),
             "state": dict(sorted(self.state.items())),

@@ -1,0 +1,313 @@
+"""Webhook server tests: auth, onboarding flow and the news trigger."""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+TOKEN = "123456:TEST-TOKEN-FOR-TESTS"
+WEBHOOK_SECRET = "hook-secret"
+TRIGGER_TOKEN = "trigger-secret"
+
+
+class ServerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tempdir = tempfile.TemporaryDirectory()
+        os.environ["DB_PATH"] = str(Path(cls._tempdir.name) / "server.db")
+        os.environ["TELEGRAM_BOT_TOKEN"] = TOKEN
+        os.environ["WEBHOOK_SECRET"] = WEBHOOK_SECRET
+        os.environ["TRIGGER_TOKEN"] = TRIGGER_TOKEN
+        os.environ["ADMIN_CHAT_ID"] = ""
+        os.environ["TELEGRAM_CHAT_IDS"] = ""
+        os.environ["GEMINI_API_KEY"] = ""
+
+        import importlib
+
+        import config
+        import server
+
+        importlib.reload(config)
+        importlib.reload(server)
+        cls.server = server
+        cls.client = server.app.test_client()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            cls.server.db().connect().close()
+        except Exception:
+            pass
+        cls._tempdir.cleanup()
+
+    def setUp(self) -> None:
+        # Each test starts from a clean user/channel set.
+        db = self.server.db()
+        db.execute("DELETE FROM users")
+        db.execute("DELETE FROM channels")
+        db.execute("DELETE FROM news_messages")
+        db.execute("DELETE FROM sent_items")
+        db.execute("DELETE FROM settings")
+        self.sent: list[dict] = []
+        self.deleted: list[tuple] = []
+
+        class FakeSender:
+            def __init__(inner, token=None):
+                pass
+
+            def get_chat_member(inner, chat_id, channel):
+                return {"status": "member"}
+
+            def send_message(inner, chat_id, text, reply_markup=None, on_sent=None, warning=""):
+                self.sent.append({"chat_id": chat_id, "text": text, "markup": reply_markup})
+                return True
+
+            def answer_callback_query(inner, callback_id, text=""):
+                return True
+
+            def delete_message(inner, chat_id, message_id):
+                self.deleted.append((chat_id, message_id))
+                return True
+
+        self._patches = [
+            patch.object(self.server, "TelegramSender", FakeSender),
+            patch.object(self.server.main, "TelegramSender", FakeSender),
+        ]
+        for patcher in self._patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    # -- helpers ------------------------------------------------------- #
+    def _message(self, text: str, chat_id: int = 900, update_id: int = 1) -> dict:
+        return {
+            "update_id": update_id,
+            "message": {
+                "message_id": update_id,
+                "date": 0,
+                "chat": {"id": chat_id, "type": "private"},
+                "from": {"id": chat_id, "first_name": "Ali", "username": "ali"},
+                "text": text,
+            },
+        }
+
+    def _callback(self, data: str, chat_id: int = 900, update_id: int = 2) -> dict:
+        return {
+            "update_id": update_id,
+            "callback_query": {
+                "id": f"cb-{update_id}",
+                "from": {"id": chat_id, "first_name": "Ali"},
+                "data": data,
+                "message": {"message_id": 7, "chat": {"id": chat_id, "type": "private"}},
+            },
+        }
+
+    def _post_update(self, payload: dict):
+        return self.client.post(f"/webhook/{WEBHOOK_SECRET}", json=payload)
+
+    # -- health -------------------------------------------------------- #
+    def test_health_reports_database_and_config(self):
+        response = self.client.get("/health")
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["webhook_configured"])
+        self.assertTrue(body["trigger_configured"])
+
+    # -- webhook auth -------------------------------------------------- #
+    def test_webhook_rejects_missing_or_wrong_secret(self):
+        self.assertEqual(self.client.post("/webhook", json=self._message("/start")).status_code, 403)
+        self.assertEqual(
+            self.client.post("/webhook/wrong", json=self._message("/start")).status_code, 403
+        )
+        self.assertEqual(self.sent, [])
+
+    def test_webhook_rejects_malformed_payloads(self):
+        self.assertEqual(self._post_update({}).status_code, 400)
+        self.assertEqual(self._post_update({"update_id": 0}).status_code, 400)
+        self.assertEqual(
+            self.client.post(f"/webhook/{WEBHOOK_SECRET}", data="not json").status_code, 400
+        )
+
+    # -- onboarding ---------------------------------------------------- #
+    def test_new_user_start_gets_the_persian_welcome(self):
+        self.assertEqual(self._post_update(self._message("/start")).status_code, 200)
+        self.assertEqual(len(self.sent), 1)
+        text = self.sent[0]["text"]
+        self.assertIn("سلام! 👋 به ربات اخبار خوش آمدید.", text)
+        self.assertIn("شما با موفقیت ثبت‌نام شدید. ✅", text)
+        self.assertIn("اشتراک اخبار: فعال", text)
+        self.assertIn("🌐 زبان: فارسی", text)
+        self.assertIsNone(self.sent[0]["markup"])
+        rows = self.server.db().query("SELECT chat_id, is_subscribed FROM users")
+        self.assertEqual(rows, [{"chat_id": "900", "is_subscribed": 1}])
+
+    def test_returning_user_start_shows_settings_keyboard(self):
+        self._post_update(self._message("/start", update_id=1))
+        self._post_update(self._message("/start", update_id=2))
+        text = self.sent[-1]["text"]
+        self.assertIn("تنظیمات شما", text)
+        self.assertIn("فعال ✅", text)
+        keyboard = self.sent[-1]["markup"]["inline_keyboard"]
+        self.assertEqual(keyboard[0][0]["callback_data"], "toggle_subscription")
+        self.assertEqual(keyboard[1][0]["callback_data"], "help")
+
+    def test_unsubscribe_and_subscribe_commands(self):
+        self._post_update(self._message("/start", update_id=1))
+        self._post_update(self._message("/unsubscribe", update_id=2))
+        self.assertIn("غیرفعال", self.sent[-1]["text"])
+        self.assertEqual(
+            self.server.db().query("SELECT is_subscribed FROM users")[0]["is_subscribed"], 0
+        )
+        self._post_update(self._message("/subscribe", update_id=3))
+        self.assertIn("فعال شد", self.sent[-1]["text"])
+        self.assertEqual(
+            self.server.db().query("SELECT is_subscribed FROM users")[0]["is_subscribed"], 1
+        )
+
+    def test_subscribe_without_registration_is_refused(self):
+        self._post_update(self._message("/subscribe"))
+        self.assertIn("/start", self.sent[-1]["text"])
+        self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM users")[0]["n"], 0)
+
+    def test_plain_text_nudges_registered_users_only(self):
+        self._post_update(self._message("hello", chat_id=901, update_id=1))
+        self.assertEqual(self.sent, [])
+        self._post_update(self._message("/start", chat_id=901, update_id=2))
+        self._post_update(self._message("hello", chat_id=901, update_id=3))
+        self.assertIn("/start", self.sent[-1]["text"])
+
+    def test_help_command_and_callback(self):
+        self._post_update(self._message("/start", update_id=1))
+        self._post_update(self._message("/help", update_id=2))
+        self.assertIn("راهنمای ربات اخبار", self.sent[-1]["text"])
+        self._post_update(self._callback("help", update_id=3))
+        self.assertIn("راهنمای ربات اخبار", self.sent[-1]["text"])
+
+    def test_toggle_callback_flips_subscription(self):
+        self._post_update(self._message("/start", update_id=1))
+        self._post_update(self._callback("toggle_subscription", update_id=2))
+        self.assertEqual(
+            self.server.db().query("SELECT is_subscribed FROM users")[0]["is_subscribed"], 0
+        )
+        self._post_update(self._callback("toggle_subscription", update_id=3))
+        self.assertEqual(
+            self.server.db().query("SELECT is_subscribed FROM users")[0]["is_subscribed"], 1
+        )
+
+    def test_unknown_callback_is_answered_without_a_message(self):
+        self._post_update(self._message("/start", update_id=1))
+        before = len(self.sent)
+        self._post_update(self._callback("something_else", update_id=2))
+        self.assertEqual(len(self.sent), before)
+
+    def test_non_private_chats_are_ignored(self):
+        payload = self._message("/start")
+        payload["message"]["chat"]["type"] = "group"
+        self._post_update(payload)
+        self.assertEqual(self.sent, [])
+
+    def test_admin_channel_and_stats_commands(self):
+        with patch.dict(os.environ, {"ADMIN_CHAT_ID": "42"}):
+            import importlib
+
+            import config
+
+            importlib.reload(config)
+            importlib.reload(self.server)
+            self.client = self.server.app.test_client()
+
+            class FakeSender:
+                def __init__(inner, token=None):
+                    pass
+
+                def get_chat_member(inner, chat_id, channel):
+                    return {"status": "member"}
+
+                def send_message(inner, chat_id, text, reply_markup=None, on_sent=None, warning=""):
+                    self.sent.append({"chat_id": chat_id, "text": text, "markup": reply_markup})
+                    return True
+
+                def answer_callback_query(inner, callback_id, text=""):
+                    return True
+
+                def delete_message(inner, chat_id, message_id):
+                    return True
+
+            # The reload re-imported TelegramSender; patch it again.
+            self.server.TelegramSender = FakeSender
+            self.server.main.TelegramSender = FakeSender
+
+            self._post_update(self._message("/addchannel @ExampleCh", chat_id=7, update_id=1))
+            self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM channels")[0]["n"], 0)
+
+            self._post_update(self._message("/addchannel @ExampleCh", chat_id=42, update_id=2))
+            self.assertEqual(
+                self.server.db().query("SELECT username FROM channels")[0]["username"], "@examplech"
+            )
+
+            self._post_update(self._message("/stats", chat_id=42, update_id=3))
+            self.assertIn("آمار کاربران", self.sent[-1]["text"])
+
+            self._post_update(self._message("/removechannel examplech", chat_id=42, update_id=4))
+            self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM channels")[0]["n"], 0)
+
+    # -- trigger ------------------------------------------------------- #
+    def test_trigger_requires_a_token(self):
+        self.assertEqual(self.client.post("/trigger_news", json={}).status_code, 401)
+        self.assertEqual(
+            self.client.post(
+                "/trigger_news", json={}, headers={"Authorization": "Bearer wrong"}
+            ).status_code,
+            401,
+        )
+
+    def test_trigger_accepts_bearer_and_x_token(self):
+        with patch.object(self.server.main, "run_news", return_value={"ok": True, "messages": 0}) as run:
+            response = self.client.post(
+                "/trigger_news?wait=1",
+                json={"cleanup_only": True},
+                headers={"Authorization": f"Bearer {TRIGGER_TOKEN}"},
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.get_json()["ok"])
+            self.assertTrue(run.called)
+
+            response = self.client.post(
+                "/trigger_news", json={}, headers={"X-Trigger-Token": TRIGGER_TOKEN}
+            )
+            self.assertEqual(response.status_code, 202)
+            self.assertTrue(response.get_json()["accepted"])
+
+    def test_trigger_reports_failures_with_500(self):
+        with patch.object(
+            self.server.main, "run_news", return_value={"ok": False, "error": "boom"}
+        ):
+            response = self.client.post(
+                "/trigger_news?wait=1", headers={"Authorization": f"Bearer {TRIGGER_TOKEN}"}
+            )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json()["error"], "boom")
+
+    def test_news_status_requires_auth_and_reports(self):
+        self.assertEqual(self.client.get("/news_status").status_code, 401)
+        with patch.object(self.server.main, "run_news", return_value={"ok": True}):
+            self.client.post(
+                "/trigger_news?wait=1", headers={"Authorization": f"Bearer {TRIGGER_TOKEN}"}
+            )
+        status = self.client.get(
+            "/news_status", headers={"Authorization": f"Bearer {TRIGGER_TOKEN}"}
+        ).get_json()
+        self.assertTrue(status["ok"])
+        self.assertFalse(status["running"])
+
+    def test_unknown_route_returns_json_404(self):
+        response = self.client.get("/nope")
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(response.get_json()["ok"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,47 @@
+services:
+  - type: web
+    name: security-radar-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements-web.txt
+    startCommand: gunicorn --workers 1 --threads 8 --timeout 180 --graceful-timeout 30 server:app
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY_1
+        sync: false
+      - key: GEMINI_API_KEY_2
+        sync: false
+      - key: GEMINI_API_KEY_3
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: TRIGGER_TOKEN
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
+      - key: DB_PATH
+        value: /var/data/bot.db
+      - key: NEWS_TTL_HOURS
+        value: "24"
+      - key: BROADCAST_DELAY
+        value: "0.05"
+      - key: TZ
+        value: Asia/Tehran
+      - key: ENABLE_PDF
+        value: "false"
+    disk:
+      name: bot-data
+      mountPath: /var/data
+      sizeGB: 1

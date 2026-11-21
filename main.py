@@ -1,32 +1,32 @@
-"""Orchestration: fetch -> filter -> triage -> summarize -> deliver."""
+"""Hybrid architecture: webhook bot on Render + scheduled news runs.
+
+One news run is: fetch -> filter -> triage -> summarize (Persian) -> deliver ->
+expire. The same function powers the CLI (``python main.py``) and the
+``/trigger_news`` endpoint that GitHub Actions calls on a schedule.
+"""
 
 from __future__ import annotations
 
 import argparse
 import html
-import json
 import logging
 import re
 import sys
+import threading
 import time
-from datetime import datetime
-from pathlib import Path
+import unicodedata
+from datetime import datetime, timedelta
 
 import config
 from analyzer import AIBudget, Analyzer, AnalyzerError, fallback_summary
 from fetcher import Item, enrich_full_text, fetch_all
 from filter import finalize_candidates, prefilter
-from pdf_report import build_daily_pdf, pdf_caption
-from store import JsonStore, MemoryStore, StoreError
-from channels_store import ChannelRegistry
-from users_store import UserRegistry
-from telegram_sender import (
-    TelegramSender,
-    handle_updates,
-    sanitize_html,
-)
+from storage import ChannelStore, NewsStore, UserStore, iso, open_database, parse_iso, stores, utc_now
+from telegram_sender import TelegramSender, handle_updates, sanitize_html
 
 log = logging.getLogger("main")
+
+PERSIAN_LANGS = ("fa",)
 
 
 # --------------------------------------------------------------------------- #
@@ -41,8 +41,7 @@ class RedactFormatter(logging.Formatter):
         text = super().format(record)
         for secret in self.secrets:
             text = text.replace(secret, "***")
-        text = re.sub(r"bot\d{6,}:[A-Za-z0-9_-]{20,}", "bot***", text)
-        return text
+        return re.sub(r"bot\d{6,}:[A-Za-z0-9_-]{20,}", "bot***", text)
 
 
 def _secrets() -> list[str]:
@@ -50,10 +49,11 @@ def _secrets() -> list[str]:
         config.TELEGRAM_BOT_TOKEN,
         *config.GEMINI_API_KEYS,
         config.GITHUB_TOKEN,
+        config.TRIGGER_TOKEN,
     ]
 
 
-def _redact(text: str) -> str:
+def redact(text: str) -> str:
     for secret in _secrets():
         if secret and len(secret) >= 8:
             text = text.replace(secret, "***")
@@ -68,35 +68,53 @@ def setup_logging(debug: bool = False) -> None:
     level = logging.DEBUG if (debug or config.DEBUG) else logging.INFO
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(
-        RedactFormatter(
-            "%(asctime)s | %(levelname)-7s | %(name)-15s | %(message)s",
-            _secrets(),
-        )
+        RedactFormatter("%(asctime)s | %(levelname)-7s | %(name)-15s | %(message)s", _secrets())
     )
     root = logging.getLogger()
-    root.handlers.clear()
-    root.addHandler(handler)
+    if not any(getattr(existing, "_secintel", False) for existing in root.handlers):
+        handler._secintel = True  # type: ignore[attr-defined]
+        root.handlers.clear()
+        root.addHandler(handler)
     root.setLevel(level)
     for noisy in ("urllib3", "trafilatura", "charset_normalizer"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 # --------------------------------------------------------------------------- #
+# Persian enforcement
+# --------------------------------------------------------------------------- #
+_PERSIAN = re.compile(r"[\u0600-\u06FF]")
+_LATIN = re.compile(r"[A-Za-z]")
+
+
+def persian_share(text: str) -> float:
+    plain = re.sub(r"<[^>]*>", " ", text or "")
+    plain = re.sub(r"https?://\S+", " ", plain)
+    persian = len(_PERSIAN.findall(plain))
+    latin = len(_LATIN.findall(plain))
+    return 0.0 if persian + latin == 0 else persian / (persian + latin)
+
+
+def looks_persian(text: str) -> bool:
+    return len(_PERSIAN.findall(text or "")) >= 30 and persian_share(text) >= 0.45
+
+
+def normalize_persian(text: str) -> str:
+    """Unify Arabic/Persian variants so output reads consistently Persian."""
+    return unicodedata.normalize("NFC", text or "").replace("\u064A", "\u06CC").replace("\u0643", "\u06A9")
+
+
+# --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Security intelligence bot")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="fetch, score and summarize without sending or writing state",
-    )
-    parser.add_argument(
-        "--no-ai", action="store_true", help="skip Gemini and use plain summaries"
-    )
-    parser.add_argument(
-        "--limit", type=int, default=0, help="cap the number of candidates"
-    )
+    parser = argparse.ArgumentParser(description="Security intelligence bot (news run)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="fetch, score and summarize without sending or writing state")
+    parser.add_argument("--no-ai", action="store_true", help="skip Gemini and use plain summaries")
+    parser.add_argument("--limit", type=int, default=0, help="cap the number of candidates")
+    parser.add_argument("--cleanup-only", action="store_true",
+                        help="only delete news older than 24h")
     parser.add_argument("--debug", action="store_true", help="verbose logging")
     return parser.parse_args(argv)
 
@@ -117,72 +135,65 @@ def _notify_admin(sender: TelegramSender | None, text: str) -> None:
         log.warning("admin notification failed")
 
 
-def _safe_admin_alert(
-    sender: TelegramSender | None, exc: Exception, dry_run: bool
-) -> None:
+def _safe_admin_alert(sender: TelegramSender | None, exc: Exception, dry_run: bool) -> None:
     if dry_run:
         return
-    detail = _redact(f"{exc.__class__.__name__}: {exc}")[:600]
+    detail = redact(f"{exc.__class__.__name__}: {exc}")[:600]
     _notify_admin(
         sender,
         "⚠️ <b>خطای اجرای ربات</b>\n"
         f"<code>{html.escape(detail)}</code>\n"
-        "<i>لاگ کامل را در GitHub Actions بررسی کنید.</i>",
+        "<i>لاگ اجرای ربات را بررسی کنید.</i>",
     )
 
 
-def _onboarding(
-    sender: TelegramSender,
-    store,
-    users: UserRegistry,
-    channels: ChannelRegistry,
-    stats: dict,
+# --------------------------------------------------------------------------- #
+# Webhook updates (called by server.py)
+# --------------------------------------------------------------------------- #
+def process_update(update: dict, sender: TelegramSender, users: UserStore, channels: ChannelStore) -> None:
+    """Handle a single Telegram update delivered to the webhook."""
+    handle_updates([update], sender, users, channels)
+
+
+def process_updates(
+    updates: list[dict], sender: TelegramSender, users: UserStore, channels: ChannelStore
 ) -> None:
-    offset = _int_state(store, "last_update_id", 0)
-    updates = sender.get_updates(offset)
-    stats["updates"] = len(updates)
-    if not updates:
-        return
-    last_update_id = handle_updates(updates, sender, users, channels)
-    if last_update_id:
-        store.set_state("last_update_id", str(last_update_id + 1))
-    try:
-        users.flush()
-        channels.flush()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("onboarding persist failed error=%s", exc.__class__.__name__)
-    log.info(
-        "onboarding updates=%d next_offset=%d users=%d channels=%d",
-        len(updates),
-        last_update_id + 1,
-        len(users.users),
-        len(channels.channels),
-    )
+    if updates:
+        handle_updates(updates, sender, users, channels)
 
 
+# --------------------------------------------------------------------------- #
+# Analysis
+# --------------------------------------------------------------------------- #
 def _store_summaries(item: Item, texts: dict[str, str]) -> None:
     item.summaries = dict(texts)
     item.summary_html = texts.get("fa") or next(iter(texts.values()), "")
 
 
+def _fallback(item: Item, lang: str) -> str:
+    return sanitize_html(fallback_summary(item, lang))
+
+
 def _analyze(
     candidates: list[Item],
-    args: argparse.Namespace,
+    no_ai: bool,
     budget: AIBudget,
     stats: dict,
     langs: list[str],
+    dry_run: bool = False,
 ) -> tuple[list[Item], bool]:
+    """Triage + summarize. Every delivered summary is enforced to be Persian."""
+    langs = [lang for lang in (langs or PERSIAN_LANGS) if lang in config.SUPPORTED_LANGS]
+    if not langs:
+        langs = ["fa"]
     if not candidates:
         return [], False
-    langs = langs or ["fa"]
 
-    if args.no_ai:
+    if no_ai:
         selected = candidates[:3]
         for item in selected:
-            _store_summaries(
-                item, {lang: fallback_summary(item, lang) for lang in langs}
-            )
-        log.info("no-ai mode selected=%d langs=%s", len(selected), ",".join(langs))
+            _store_summaries(item, {lang: _fallback(item, lang) for lang in langs})
+        log.info("no-ai mode selected=%d", len(selected))
         return selected, False
 
     try:
@@ -191,27 +202,21 @@ def _analyze(
         log.warning("analyzer unavailable: %s", exc)
         selected = candidates[:3]
         for item in selected:
-            _store_summaries(
-                item, {lang: fallback_summary(item, lang) for lang in langs}
-            )
+            _store_summaries(item, {lang: _fallback(item, lang) for lang in langs})
         return selected, False
 
     log.info("analyzer keys=%d langs=%s", analyzer.key_count, ",".join(langs))
     selected = analyzer.triage(candidates)
     if selected is None:
-        fallback = candidates[:3]
-        for item in fallback:
-            _store_summaries(
-                item, {lang: fallback_summary(item, lang) for lang in langs}
-            )
-        log.warning(
-            "triage unavailable; delivering top=%d with plain summaries",
-            len(fallback),
-        )
-        return fallback, budget.daily_remaining() <= 0
+        fallback_items = candidates[:3]
+        for item in fallback_items:
+            _store_summaries(item, {lang: _fallback(item, lang) for lang in langs})
+        log.warning("triage unavailable; delivering top=%d with plain summaries", len(fallback_items))
+        return fallback_items, budget.daily_remaining() <= 0
 
     approved: list[Item] = []
     quota_exhausted = False
+    rejected = 0
     for item in selected[: config.MAX_ITEMS_PER_RUN]:
         texts: dict[str, str] = {}
         skipped = False
@@ -219,14 +224,26 @@ def _analyze(
             result = analyzer.summarize(item, lang)
             if result.status == "quota":
                 quota_exhausted = True
-                texts[lang] = result.text or fallback_summary(item, lang)
+                texts[lang] = normalize_persian(result.text or _fallback(item, lang))
                 continue
             if result.status == "skip":
                 if index == 0 and not texts:
                     skipped = True
                     break
                 continue
-            texts[lang] = result.text or fallback_summary(item, lang)
+            text = sanitize_html(result.text or "")
+            if lang == "fa":
+                if not looks_persian(text):
+                    rejected += 1
+                    log.warning(
+                        "non-Persian summary rejected source=%s persian_share=%.2f",
+                        item.source_label,
+                        persian_share(text),
+                    )
+                    text = _fallback(item, lang)
+                else:
+                    text = normalize_persian(text)
+            texts[lang] = text or _fallback(item, lang)
         if skipped or not texts:
             continue
         _store_summaries(item, texts)
@@ -234,244 +251,195 @@ def _analyze(
 
     stats["ai_calls"] = budget.used_this_run
     log.info(
-        "analysis approved=%d ai_calls=%d daily_remaining=%d",
+        "analysis approved=%d ai_calls=%d rejected_non_persian=%d daily_remaining=%d",
         len(approved),
         budget.used_this_run,
+        rejected,
         budget.daily_remaining(),
     )
     return approved, quota_exhausted
 
 
-def _deliver(
+# --------------------------------------------------------------------------- #
+# Delivery
+# --------------------------------------------------------------------------- #
+def _recipients(users: UserStore, days: int = 0) -> list[int]:
+    """Configured chat IDs (never gated) followed by every subscribed user."""
+    ordered: list[str] = [str(value) for value in config.recipient_chat_ids()]
+    if days:
+        cutoff = iso(utc_now() - timedelta(days=days))
+        rows = users.db.query(
+            "SELECT chat_id FROM users WHERE is_subscribed = 1 AND last_seen >= ? ORDER BY chat_id",
+            (cutoff,),
+        )
+        subscribed = [str(row["chat_id"]) for row in rows]
+    else:
+        subscribed = [str(chat_id) for chat_id in users.chat_ids(subscribed_only=True)]
+
+    unique: list[str] = []
+    for value in ordered + subscribed:
+        if value in unique:
+            continue
+        try:
+            int(value)
+        except (TypeError, ValueError):
+            continue
+        unique.append(value)
+    if not unique and config.ADMIN_CHAT_ID:
+        unique = [str(config.ADMIN_CHAT_ID)]
+    return [int(value) for value in unique]
+
+
+def deliver_news(
     approved: list[Item],
-    store,
-    sender: TelegramSender | None,
+    store: NewsStore,
+    sender: TelegramSender,
+    users: UserStore,
+    channels: ChannelStore,
     now: datetime,
-    dry_run: bool,
-    recipients: list[int | str],
-    users: UserRegistry,
     stats: dict,
+    quota_notice: bool = False,
 ) -> None:
     if not approved:
         return
-    if dry_run:
-        print("\n=== DRY RUN PREVIEW ===", flush=True)
-        print(f"approved={len(approved)}", flush=True)
-        for item in approved:
-            print("-" * 72, flush=True)
-            print(
-                f"score={item.score:.2f} category={item.category} "
-                f"source={item.source_label}",
-                flush=True,
-            )
-            print(item.url, flush=True)
-            print(sanitize_html(item.summary_html), flush=True)
+
+    recipients = _recipients(users)
+    stats["recipients"] = len(recipients)
+    if not recipients:
+        log.warning("no recipients: set TELEGRAM_CHAT_IDS or have users send /start")
         return
 
-    assert sender is not None
-    if not recipients:
-        log.warning(
-            "no recipients: set TELEGRAM_CHAT_IDS (or ADMIN_CHAT_ID) to your "
-            "chat id from /start"
-        )
+    # Membership is checked once per run, not once per article.
+    gated: dict[int, bool] = {}
+    for chat_id in recipients:
+        if not channels.channels or str(chat_id) in {str(value) for value in config.recipient_chat_ids()}:
+            gated[chat_id] = True
+            continue
+        try:
+            gated[chat_id] = not channels.missing_for(sender, chat_id)
+        except Exception:
+            gated[chat_id] = True  # never drop delivery because the gate errored
+
+    blocked: set[int] = set()
+    lang = config.DEFAULT_LANG
 
     for item in approved:
-        delivered = False
+        text = item.summaries.get(lang) or item.summary_html
+        if not text:
+            continue
+        notice = config.news_expiry_warning(lang)
+        delivered = 0
         for chat_id in recipients:
-            lang = users.lang(chat_id)
-            text = (
-                item.summaries.get(lang)
-                or item.summaries.get("fa")
-                or item.summary_html
-            )
-            if not text:
+            if chat_id in blocked:
                 continue
-            if sender.send_message(chat_id, text):
-                delivered = True
+            if not gated.get(chat_id, True):
+                continue
+            try:
+                sent = sender.send_message(
+                    chat_id,
+                    text,
+                    on_sent=store.record_news_message,
+                    warning=notice,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("delivery failed chat=%s err=%s", chat_id, exc.__class__.__name__)
+                continue
+            if sent:
+                delivered += 1
                 stats["messages"] += 1
+            else:
+                blocked.add(chat_id)
+                users.set_subscribed(chat_id, False)
             time.sleep(config.BROADCAST_DELAY)
         if delivered:
-            store.log_sent(
-                item.hash,
-                item.url,
-                item.title,
-                item.category,
-                now.isoformat(timespec="seconds"),
-            )
+            store.log_sent(item.hash, item.url, item.title, item.category, iso(now))
+
+    if quota_notice:
+        _notify_admin(sender, config.QUOTA_NOTICE)
     log.info(
-        "delivery items=%d recipients=%d messages=%d",
+        "delivery items=%d recipients=%d messages=%d blocked=%d",
         len(approved),
         len(recipients),
         stats["messages"],
+        len(blocked),
     )
 
 
-def _recipient_langs(
-    recipients: list[int | str], users: UserRegistry
-) -> list[str]:
-    langs: list[str] = []
-    for chat_id in recipients:
-        lang = users.lang(chat_id)
-        if lang not in langs:
-            langs.append(lang)
-    return langs or [config.DEFAULT_LANG]
-
-
-def _buffer_pdf_items(store, approved: list[Item], today: str) -> None:
-    if not config.ENABLE_PDF or not approved:
-        return
-    raw = (
-        store.get_state("pdf_buffer", "")
-        if store.get_state("pdf_buffer_date", "") == today
-        else ""
-    )
-    try:
-        buffer = json.loads(raw) if raw else []
-    except (TypeError, ValueError):
-        buffer = []
-    if not isinstance(buffer, list):
-        buffer = []
-    existing = {
-        entry.get("url") for entry in buffer if isinstance(entry, dict)
-    }
-    for item in approved:
-        if item.url in existing:
-            continue
-        buffer.append(
-            {
-                "title": item.title,
-                "url": item.url,
-                "category": item.category,
-                "source": item.source_label,
-                "html": item.summary_html,
-            }
-        )
-        existing.add(item.url)
-    blob = json.dumps(buffer, ensure_ascii=False)
-    while len(buffer) > 1 and len(blob) > config.PDF_BUFFER_MAX_CHARS:
-        buffer.pop(0)
-        blob = json.dumps(buffer, ensure_ascii=False)
-    store.set_state("pdf_buffer_date", today)
-    store.set_state("pdf_buffer", blob)
-
-
-def _maybe_send_pdf(
-    store,
-    sender: TelegramSender | None,
-    now: datetime,
-    today: str,
-    dry_run: bool,
-    recipients: list[int | str],
-    stats: dict,
-) -> None:
-    if dry_run or not config.ENABLE_PDF or sender is None:
-        return
-    if store.get_state("last_pdf_date") == today:
-        return
-    if now.hour < config.PDF_SEND_HOUR:
-        return
-    if store.get_state("pdf_buffer_date") != today:
-        return
-    try:
-        buffer = json.loads(store.get_state("pdf_buffer", "") or "[]")
-    except (TypeError, ValueError):
-        return
-    if not isinstance(buffer, list) or not buffer:
-        return
-
-    output = Path(config.ROOT_DIR) / "build" / f"security-digest-{today}.pdf"
-    path = build_daily_pdf(buffer, output, day=today)
-    if path is None:
-        return
-    content = path.read_bytes()
-    targets = list(recipients)
-    if not targets:
-        log.warning("pdf built but no recipients configured")
-        return
-
-    caption = pdf_caption(today, len(buffer))
-    sent = False
-    for chat_id in targets:
-        if sender.send_document(chat_id, path.name, content, caption):
-            sent = True
-            stats["pdf_documents"] += 1
-        time.sleep(config.BROADCAST_DELAY)
-    if sent:
-        store.set_state("last_pdf_date", today)
-        store.set_state("pdf_buffer", "[]")
-        log.info("pdf sent targets=%d items=%d", len(targets), len(buffer))
+# --------------------------------------------------------------------------- #
+# Expiry
+# --------------------------------------------------------------------------- #
+def cleanup_expired(store: NewsStore, sender: TelegramSender, limit: int = 500) -> dict:
+    """Delete news messages older than NEWS_LIFETIME_SECONDS."""
+    now = utc_now()
+    deleted = failed = 0
+    for entry in store.due_news_messages(now)[:limit]:
+        if sender.delete_message(entry["chat_id"], entry["message_id"]):
+            store.remove_news_message(entry)
+            deleted += 1
+        else:
+            failed += 1
+    if deleted or failed:
+        log.info("cleanup deleted=%d failed=%d", deleted, failed)
+    return {"deleted": deleted, "failed": failed}
 
 
 # --------------------------------------------------------------------------- #
-# Main pipeline
+# One news run
 # --------------------------------------------------------------------------- #
-def run(args: argparse.Namespace) -> int:
+_RUN_LOCK = threading.Lock()
+
+
+def run_news(
+    *,
+    dry_run: bool = False,
+    no_ai: bool = False,
+    limit: int = 0,
+    cleanup_only: bool = False,
+    database_url: str = "",
+) -> dict:
+    """Fetch, summarize and deliver one batch of news. Safe to call from threads."""
     started = time.monotonic()
-    now = datetime.now(config.TEHRAN_TZ)
-    today = now.date().isoformat()
-    dry_run = bool(args.dry_run or config.DRY_RUN)
-
-    stats: dict = {
-        "updates": 0,
+    stats = {"updates": 0, "messages": 0, "ai_calls": 0, "recipients": 0}
+    result: dict = {
+        "ok": True,
+        "dry_run": dry_run,
+        "fetched": 0,
+        "approved": 0,
         "messages": 0,
-        "pdf_documents": 0,
-        "ai_calls": 0,
+        "deleted": 0,
+        "elapsed": 0.0,
+        "error": "",
     }
-    store = None
-    sender: TelegramSender | None = None
-    budget: AIBudget | None = None
-    used_today = 0
-    had_error = False
 
-    log.info(
-        "run_start mode=%s today=%s hour=%d model=%s",
-        "dry-run" if dry_run else "live",
-        today,
-        now.hour,
-        config.GEMINI_MODEL,
-    )
-    recipients = config.recipient_chat_ids()
-    users = UserRegistry(config.USERS_FILE, read_only=dry_run)
-    channels = ChannelRegistry(config.CHANNELS_FILE, read_only=dry_run)
+    if not _RUN_LOCK.acquire(blocking=False):
+        log.warning("news run skipped: another run is in progress")
+        result.update(ok=False, error="run already in progress")
+        return result
 
+    db = None
     try:
-        store = MemoryStore() if dry_run else JsonStore(config.STATE_FILE)
-        store.load()
-        users.load()
-        channels.load()
+        db = open_database(database_url)
+        users, channels, store = stores(db)
+        sender = None if dry_run else TelegramSender(config.TELEGRAM_BOT_TOKEN)
 
-        if not dry_run:
-            sender = TelegramSender(config.TELEGRAM_BOT_TOKEN)
-            _onboarding(sender, store, users, channels, stats)
+        if sender is not None:
+            expired = cleanup_expired(store, sender)
+            result["deleted"] = expired["deleted"]
+        if cleanup_only:
+            result["elapsed"] = round(time.monotonic() - started, 1)
+            return result
 
-        for chat_id in users.chat_ids():
-            if chat_id not in recipients:
-                recipients.append(chat_id)
-        recipients = list(dict.fromkeys(recipients))
-        if not recipients and config.ADMIN_CHAT_ID:
-            recipients = [config.ADMIN_CHAT_ID]
-        langs = _recipient_langs(recipients, users)
-        log.info(
-            "recipients count=%d users=%d channels=%d langs=%s",
-            len(recipients),
-            len(users.users),
-            len(channels.channels),
-            ",".join(langs),
-        )
+        now = utc_now()
+        today = now.astimezone(config.TEHRAN_TZ).date().isoformat()
 
         raw_items = fetch_all()
         filter_result = prefilter(raw_items, store.sent_hashes, now)
         candidates = filter_result.items
         enrich_full_text(candidates)
         candidates = finalize_candidates(candidates)
-        if args.limit > 0:
-            candidates = candidates[: args.limit]
-        log.info(
-            "candidates fetched=%d stage1=%d final=%d",
-            len(raw_items),
-            filter_result.counters.get("kept", 0),
-            len(candidates),
-        )
+        if limit > 0:
+            candidates = candidates[:limit]
+        result["fetched"] = len(raw_items)
 
         used_today = (
             _int_state(store, "ai_calls_today", 0)
@@ -483,74 +451,76 @@ def run(args: argparse.Namespace) -> int:
             daily=config.DAILY_AI_BUDGET,
             used_today=used_today,
         )
-        approved, quota_exhausted = _analyze(candidates, args, budget, stats, langs)
 
-        _deliver(
-            approved, store, sender, now, dry_run, recipients, users, stats
+        approved, quota_exhausted = _analyze(
+            candidates, no_ai, budget, stats, ["fa"], dry_run=dry_run
         )
-        _buffer_pdf_items(store, approved, today)
-        _maybe_send_pdf(store, sender, now, today, dry_run, recipients, stats)
+        result["approved"] = len(approved)
 
-        if quota_exhausted:
-            log.warning("gemini daily quota exhausted for this run")
-            _notify_admin(sender, config.QUOTA_NOTICE)
+        if dry_run:
+            _print_preview(approved)
+        else:
+            deliver_news(approved, store, sender, users, channels, now, stats, quota_exhausted)
+            if config.ADMIN_CHAT_ID and stats["recipients"]:
+                summary = (
+                    f"✅ خبر جدید ارسال شد: {len(approved)} مورد به {stats['recipients']} کاربر."
+                    if approved
+                    else "⚠️ اجرای خبر تمام شد اما خبری ارسال نشد."
+                )
+                _notify_admin(sender, summary)
 
-        counters = filter_result.counters
-        log.info(
-            "run_summary fetched=%d duplicates=%d stale=%d kept=%d approved=%d "
-            "ai_calls=%d messages=%d updates=%d users=%d elapsed=%.1fs",
-            len(raw_items),
-            counters.get("duplicate", 0),
-            counters.get("stale", 0),
-            counters.get("kept", 0),
-            len(approved),
-            budget.used_this_run,
-            stats["messages"],
-            stats["updates"],
-            len(users.users),
-            time.monotonic() - started,
-        )
-    except StoreError as exc:
-        had_error = True
-        log.error("state error: %s", exc)
-        _safe_admin_alert(sender, exc, dry_run)
-    except Exception as exc:
-        had_error = True
-        log.exception("unhandled run failure")
-        _safe_admin_alert(sender, exc, dry_run)
-    finally:
-        if store is not None:
-            if budget is not None:
-                try:
-                    store.set_state("ai_calls_date", today)
-                    store.set_state(
-                        "ai_calls_today",
-                        str(used_today + budget.used_this_run),
-                    )
-                except Exception:
-                    log.exception("failed to update ai counters")
+        store.set_state("ai_calls_date", today)
+        store.set_state("ai_calls_today", str(used_today + budget.used_this_run))
+        store.set_state("last_run_at", iso())
+        store.set_state("last_run_approved", str(len(approved)))
+        result["messages"] = stats["messages"]
+    except Exception as exc:  # noqa: BLE001
+        result.update(ok=False, error=redact(f"{exc.__class__.__name__}: {exc}")[:400])
+        log.exception("news run failed")
+        if not dry_run:
             try:
-                store.flush()
-                users.flush()
-                channels.flush()
-            except Exception as exc:
-                had_error = True
-                log.exception("final flush failed")
-                if dry_run is False:
-                    _safe_admin_alert(sender, exc, dry_run)
+                _safe_admin_alert(TelegramSender(config.TELEGRAM_BOT_TOKEN), exc, dry_run)
+            except Exception:
+                pass
+    finally:
+        result["elapsed"] = round(time.monotonic() - started, 1)
+        log.info(
+            "news_run ok=%s fetched=%d approved=%d messages=%d deleted=%d elapsed=%.1fs",
+            result["ok"],
+            result["fetched"],
+            result["approved"],
+            result["messages"],
+            result["deleted"],
+            result["elapsed"],
+        )
+        _RUN_LOCK.release()
+    return result
 
-    log.info("run_finished errors=%s elapsed=%.1fs", had_error, time.monotonic() - started)
-    return 1 if had_error else 0
+
+def _print_preview(approved: list[Item]) -> None:
+    print("\n=== DRY RUN PREVIEW ===", flush=True)
+    print(f"approved={len(approved)}", flush=True)
+    for item in approved:
+        print("-" * 72, flush=True)
+        print(f"score={item.score:.2f} category={item.category} source={item.source_label}", flush=True)
+        print(item.url, flush=True)
+        print(sanitize_html(item.summary_html), flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     setup_logging(args.debug)
     try:
-        return run(args)
+        result = run_news(
+            dry_run=args.dry_run or config.DRY_RUN,
+            no_ai=args.no_ai,
+            limit=args.limit,
+            cleanup_only=args.cleanup_only,
+        )
     except KeyboardInterrupt:
         log.warning("interrupted")
         return 130
+    return 0 if result["ok"] else 1
 
 
 if __name__ == "__main__":

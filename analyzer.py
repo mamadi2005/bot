@@ -475,7 +475,10 @@ class Analyzer:
                 break
         if last_error is None:
             raise AnalyzerError("all Gemini API keys are exhausted")
-        raise AnalyzerError(f"gemini call failed: {last_error}")
+        raise AnalyzerError(
+            f"gemini call failed: {last_error.__class__.__name__} "
+            f"(status={_status_code(last_error)})"
+        ) from None
 
     # ------------------------------------------------------------------ #
     def triage(self, items: list[Item]) -> list[Item] | None:

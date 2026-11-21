@@ -21,7 +21,8 @@ def normalize_channel(value: str) -> str:
     if not text.startswith("@"):
         text = "@" + text.lstrip("/")
     text = text.rstrip("/")
-    return text if len(text) > 1 else ""
+    # Telegram usernames are case-insensitive; store one canonical form.
+    return text.lower() if len(text) > 1 else ""
 
 
 def join_url(channel: str) -> str:

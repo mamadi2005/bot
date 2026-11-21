@@ -83,6 +83,23 @@ TELEGRAM_BOT_TOKEN = env_str("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = env_chat_id("ADMIN_CHAT_ID")
 GITHUB_TOKEN = env_str("GITHUB_TOKEN")
 
+# --------------------------------------------------------------------------- #
+# Webhook / scheduled-trigger deployment (Render + GitHub Actions)
+# --------------------------------------------------------------------------- #
+DATABASE_URL = env_str("DATABASE_URL")
+DB_PATH = env_str("DB_PATH", "data/bot.db")
+PUBLIC_BASE_URL = env_str("PUBLIC_BASE_URL").rstrip("/")
+# Shared secret in the webhook path (/webhook/<secret>) and Telegram's
+# X-Telegram-Bot-Api-Secret-Token header.
+WEBHOOK_SECRET = env_str("WEBHOOK_SECRET")
+# Bearer token required by POST /trigger_news; GitHub Actions sends it.
+TRIGGER_TOKEN = env_str("TRIGGER_TOKEN")
+# Render injects PORT; kept here so the CLI can report it consistently.
+PORT = env_int("PORT", 8080)
+# How long a news message lives before the cleanup pass deletes it.
+NEWS_TTL_HOURS = env_int("NEWS_TTL_HOURS", 24)
+
+
 
 def _gemini_keys() -> list[str]:
     """GEMINI_API_KEY_1..3 plus the legacy single GEMINI_API_KEY, deduplicated."""
@@ -257,8 +274,41 @@ REDDIT_PER_SUB = env_int("REDDIT_PER_SUB", 25)
 # Delivery behaviour
 # --------------------------------------------------------------------------- #
 MESSAGE_DELAY_SAME_CHAT = env_float("MESSAGE_DELAY_SAME_CHAT", 1.0)
+# Delay between two different recipients so large broadcasts stay under
+# Telegram's ~30 messages/second global limit.
 BROADCAST_DELAY = env_float("BROADCAST_DELAY", 0.05)
 MAX_MESSAGE_CHARS = 4000
+NEWS_LIFETIME_SECONDS = NEWS_TTL_HOURS * 60 * 60
+LOCAL_POLL_SECONDS = 10
+LOCAL_CLEANUP_SECONDS = 60
+
+
+def local_fetch_interval_seconds() -> int:
+    """Validate the local news interval independently of ordinary one-shot runs."""
+    raw = env_str("LOCAL_FETCH_INTERVAL_SECONDS", "14400")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "LOCAL_FETCH_INTERVAL_SECONDS must be an integer from 60 to 604800"
+        ) from exc
+    if not 60 <= value <= 604800:
+        raise ValueError("LOCAL_FETCH_INTERVAL_SECONDS must be an integer from 60 to 604800")
+    return value
+
+
+def news_expiry_warning(lang: str) -> str:
+    if lang == "en":
+        return (
+            "This news message will be deleted after about 24 hours. "
+            "Save it to Saved Messages to keep it."
+        )
+    return (
+        "این پیام خبری حدود ۲۴ ساعت بعد حذف می‌شود. "
+        "برای نگهداری، آن را در Saved Messages ذخیره کنید."
+    )
+
+
 PDF_SEND_HOUR = env_int("PDF_SEND_HOUR", 18)
 PDF_BUFFER_MAX_CHARS = env_int("PDF_BUFFER_MAX_CHARS", 30000)
 
@@ -526,7 +576,7 @@ def welcome_text(lang: str, chat_id: int | str) -> str:
     if lang == "en":
         return (
             "🎯 <b>Security Radar — Cyber &amp; AI Security Intelligence</b>\n\n"
-            "Every 4 hours I collect the newest security analysis from trusted "
+            "I periodically collect the newest security analysis from trusted "
             "sources and send it to you.\n\n"
             f"<b>Your Chat ID:</b> <code>{chat_id}</code>\n"
             "<b>Language:</b> English\n\n"
@@ -534,7 +584,7 @@ def welcome_text(lang: str, chat_id: int | str) -> str:
         )
     return (
         "🎯 <b>رادار امنیت — هوش تهدید سایبری و امنیت هوش مصنوعی</b>\n\n"
-        "این ربات هر ۴ ساعت جدیدترین تحلیل‌ها و ابزارهای امنیتی را از منابع معتبر "
+        "این ربات به‌صورت دوره‌ای جدیدترین تحلیل‌ها و ابزارهای امنیتی را از منابع معتبر "
         "جمع‌آوری و برای شما ارسال می‌کند.\n\n"
         f"<b>Chat ID شما:</b> <code>{chat_id}</code>\n"
         "<b>زبان:</b> فارسی\n\n"
@@ -549,14 +599,14 @@ def help_text(lang: str = "fa") -> str:
             "/start — register and choose language\n"
             "/lang — change summary language\n"
             "/help — this help\n\n"
-            "Summaries are delivered automatically every 4 hours."
+            "Summaries are delivered automatically at the configured interval."
         )
     return (
         "<b>راهنمای ربات</b>\n\n"
         "/start — ثبت‌نام و انتخاب زبان\n"
         "/lang — تغییر زبان خلاصه‌ها\n"
             "/help — همین راهنما\n\n"
-        "ارسال تحلیل‌ها به‌صورت خودکار هر ۴ ساعت انجام می‌شود."
+        "ارسال تحلیل‌ها به‌صورت خودکار در بازه تنظیم‌شده انجام می‌شود."
     )
 
 
