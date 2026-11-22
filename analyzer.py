@@ -36,6 +36,7 @@ methodology with concrete payloads, and new offensive/defensive security or
 AI-security tooling.
 
 LANGUAGE:
+You MUST respond ONLY in fluent Persian (Farsi) language.
 Write in fluent, natural, professional technical Persian.
 Keep ALL technical terms in English and wrap each in <code> tags:
 <code>XSS</code>, <code>SSRF</code>, <code>IDOR</code>, <code>RCE</code>,
@@ -107,6 +108,7 @@ methodology with concrete payloads, and new offensive/defensive security or
 AI-security tooling.
 
 LANGUAGE:
+You MUST respond ONLY in English language.
 Write in fluent, natural, professional technical English.
 Keep ALL technical terms in English and wrap each in <code> tags:
 <code>XSS</code>, <code>SSRF</code>, <code>IDOR</code>, <code>RCE</code>,

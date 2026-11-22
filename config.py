@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -564,31 +565,45 @@ STATS_ACTIVE_DAYS = env_int("STATS_ACTIVE_DAYS", 30)
 # --------------------------------------------------------------------------- #
 # User-facing copy (Persian + English)
 # --------------------------------------------------------------------------- #
-def choose_language_text() -> str:
-    return (
-        "🌐 <b>Language / زبان</b>\n\n"
-        "Please choose the language for your summaries.\n"
-        "لطفاً زبان خلاصه‌ها را انتخاب کنید."
-    )
+def detect_language(code: str | None) -> str:
+    """Map Telegram's ``language_code`` to a supported language.
+
+    Any code starting with ``fa`` is Persian; every other known code is English.
+    A missing code falls back to ``DEFAULT_LANG``.
+    """
+    text = str(code or "").strip().lower()
+    if text.startswith("fa"):
+        return "fa"
+    if text:
+        return "en"
+    return DEFAULT_LANG
+
+
+def language_name(lang: str) -> str:
+    return LANG_LABELS.get(lang, LANG_LABELS[DEFAULT_LANG])
+
+
+def choose_language_text(lang: str = "fa") -> str:
+    if lang == "en":
+        return "🌐 <b>Language</b>\n\nPlease choose the language for your news summaries."
+    return "🌐 <b>زبان</b>\n\nلطفاً زبان خلاصه‌های خبری خود را انتخاب کنید."
 
 
 def welcome_text(lang: str, chat_id: int | str) -> str:
     if lang == "en":
         return (
-            "🎯 <b>Security Radar — Cyber &amp; AI Security Intelligence</b>\n\n"
-            "I periodically collect the newest security analysis from trusted "
-            "sources and send it to you.\n\n"
-            f"<b>Your Chat ID:</b> <code>{chat_id}</code>\n"
-            "<b>Language:</b> English\n\n"
-            "Commands: /lang to change language, /help for help."
+            'Hello! 👋 Welcome to the news bot.\n'
+            'You have been registered successfully. ✅\n'
+            'News subscription: active\n'
+            '🌐 Language: English\n'
+            'Use /lang to change the language.'
         )
     return (
-        "🎯 <b>رادار امنیت — هوش تهدید سایبری و امنیت هوش مصنوعی</b>\n\n"
-        "این ربات به‌صورت دوره‌ای جدیدترین تحلیل‌ها و ابزارهای امنیتی را از منابع معتبر "
-        "جمع‌آوری و برای شما ارسال می‌کند.\n\n"
-        f"<b>Chat ID شما:</b> <code>{chat_id}</code>\n"
-        "<b>زبان:</b> فارسی\n\n"
-        "دستورها: /lang برای تغییر زبان، /help برای راهنما."
+        'سلام! 👋 به ربات اخبار خوش آمدید.\n'
+        'شما با موفقیت ثبت‌نام شدید. ✅\n'
+        'اشتراک اخبار: فعال\n'
+        '🌐 زبان: فارسی\n'
+        'برای تغییر زبان /lang را بزنید.'
     )
 
 
@@ -596,48 +611,159 @@ def help_text(lang: str = "fa") -> str:
     if lang == "en":
         return (
             "<b>Bot help</b>\n\n"
-            "/start — register and choose language\n"
-            "/lang — change summary language\n"
+            "/start — show settings and subscription status\n"
+            "/subscribe — turn news on\n"
+            "/unsubscribe — turn news off\n"
+            "/lang — change language\n"
             "/help — this help\n\n"
-            "Summaries are delivered automatically at the configured interval."
+            "News is delivered at 08:00, 12:00, 16:00, 20:00 and 00:00 (Tehran time) "
+            "and each message is deleted after about 24 hours."
         )
     return (
-        "<b>راهنمای ربات</b>\n\n"
-        "/start — ثبت‌نام و انتخاب زبان\n"
-        "/lang — تغییر زبان خلاصه‌ها\n"
-            "/help — همین راهنما\n\n"
-        "ارسال تحلیل‌ها به‌صورت خودکار در بازه تنظیم‌شده انجام می‌شود."
+        "<b>راهنمای ربات اخبار</b>\n\n"
+        "/start — نمایش تنظیمات و وضعیت اشتراک\n"
+        "/subscribe — فعال‌کردن اشتراک اخبار\n"
+        "/unsubscribe — غیرفعال‌کردن اشتراک اخبار\n"
+        "/lang — تغییر زبان\n"
+        "/help — همین راهنما\n\n"
+        "اخبار در ساعت‌های ۰۸:۰۰، ۱۲:۰۰، ۱۶:۰۰، ۲۰:۰۰ و ۰۰:۰۰ (به وقت تهران) ارسال می‌شود "
+        "و هر خبر حدود ۲۴ ساعت بعد حذف می‌شود."
     )
 
 
-def join_required_text() -> str:
+def settings_text(lang: str, subscribed: bool) -> str:
+    if lang == "en":
+        state = "active ✅" if subscribed else "inactive ⛔"
+        return f"<b>Your settings</b>\n\nSubscription: {state}\n🌐 Language: English"
+    state = "فعال ✅" if subscribed else "غیرفعال ⛔"
+    return f"<b>تنظیمات شما</b>\n\nوضعیت اشتراک: {state}\n🌐 زبان: فارسی"
+
+
+def subscription_changed_text(lang: str, subscribed: bool) -> str:
+    if lang == "en":
+        return "News subscription is now active. ✅" if subscribed else "News subscription is now off. ⛔"
+    return "اشتراک اخبار فعال شد. ✅" if subscribed else "اشتراک اخبار غیرفعال شد. ⛔"
+
+
+def toggle_subscription_text(lang: str, subscribed: bool) -> str:
+    if lang == "en":
+        return "Turn news off" if subscribed else "Turn news on"
+    return "غیرفعال‌کردن اشتراک" if subscribed else "فعال‌کردن اشتراک"
+
+
+def language_button_text(lang: str) -> str:
+    return "Language 🌐" if lang == "en" else "زبان 🌐"
+
+
+def help_button_text(lang: str) -> str:
+    return "Help" if lang == "en" else "راهنما"
+
+
+def hint_text(lang: str) -> str:
+    if lang == "en":
+        return "Use /start to see your settings."
+    return "برای مشاهده تنظیمات /start را بزنید"
+
+
+def register_first_text(lang: str) -> str:
+    if lang == "en":
+        return "Please register first with /start."
+    return "ابتدا در ربات ثبت‌نام کنید: /start"
+
+
+def language_prompt_text(lang: str) -> str:
+    return choose_language_text(lang)
+
+
+def language_saved_text(lang: str) -> str:
+    return "Language set to English. ✅" if lang == "en" else "زبان روی فارسی تنظیم شد. ✅"
+
+
+def join_required_text(lang: str, channels: list[dict] | None = None) -> str:
+    lines: list[str] = []
+    for entry in channels or []:
+        name = html.escape(str(entry.get("name") or entry.get("username") or ""), quote=False)
+        link = html.escape(str(entry.get("link") or ""), quote=True)
+        if name and link:
+            lines.append(f'📢 <a href="{link}">{name}</a>')
+        elif name:
+            lines.append(f"📢 {name}")
+    body = "\n".join(lines)
+    if lang == "en":
+        return (
+            "⚠️ To use zerobot, you must first join the channel below:\n\n"
+            f"{body}\n\nAfter joining, click the button below."
+        )
     return (
-        "⚠️ <b>برای استفاده از ربات، ابتدا باید در کانال‌های زیر عضو شوید:</b>\n"
-        "<i>To use this bot, please join the channels below first:</i>"
+        "⚠️ برای استفاده از zerobot، ابتدا باید عضو کانال زیر شوید:\n\n"
+        f"{body}\n\nپس از عضویت، دکمه زیر را بزنید."
     )
 
 
-def stats_text(total: int, active: int, days: int = STATS_ACTIVE_DAYS) -> str:
+def confirm_join_text(lang: str) -> str:
+    return "✅ I've Joined" if lang == "en" else "✅ تایید عضویت"
+
+
+def join_confirmed_text(lang: str) -> str:
+    return "Membership confirmed. ✅" if lang == "en" else "عضویت تایید شد. ✅"
+
+
+def join_again_text(lang: str) -> str:
+    return "Join the channel first, then press the button." if lang == "en" else "ابتدا در کانال عضو شوید، سپس دکمه را بزنید."
+
+
+def stats_text(
+    lang: str,
+    total: int,
+    subscribed: int,
+    active: int,
+    days: int = STATS_ACTIVE_DAYS,
+) -> str:
+    if lang == "en":
+        return (
+            "<b>Bot statistics</b>\n\n"
+            f"Total users: <code>{total}</code>\n"
+            f"Subscribed: <code>{subscribed}</code>\n"
+            f"Active in the last {days} days: <code>{active}</code>"
+        )
     return (
-        "📊 <b>آمار ربات:</b>\n\n"
-        f"👥 تعداد کل کاربران (بر اساس /start): <code>{total}</code>\n"
-        f"📅 کاربران فعال {days} روز اخیر: <code>{active}</code>"
+        "<b>آمار کاربران</b>\n\n"
+        f"کل: <code>{total}</code>\n"
+        f"مشترک: <code>{subscribed}</code>\n"
+        f"فعال در {days} روز اخیر: <code>{active}</code>"
     )
 
 
-def channel_added_text(channel: str) -> str:
+def channel_added_text(lang: str, channel: str) -> str:
+    if lang == "en":
+        return f"✅ Channel <code>{channel}</code> was added to the required list."
     return f"✅ کانال <code>{channel}</code> به لیست عضویت اجباری اضافه شد."
 
 
-def channel_removed_text(channel: str) -> str:
+def channel_removed_text(lang: str, channel: str) -> str:
+    if lang == "en":
+        return f"🗑 Channel <code>{channel}</code> was removed from the list."
     return f"🗑 کانال <code>{channel}</code> از لیست حذف شد."
 
 
-def channel_missing_text(channel: str) -> str:
+def channel_missing_text(lang: str, channel: str) -> str:
+    if lang == "en":
+        return f"❗️ Channel <code>{channel}</code> is not in the list."
     return f"❗️ کانال <code>{channel}</code> در لیست نیست."
 
 
-def channel_usage_text() -> str:
+def channel_exists_text(lang: str, channel: str) -> str:
+    if lang == "en":
+        return f"ℹ️ Channel <code>{channel}</code> is already configured."
+    return f"ℹ️ کانال <code>{channel}</code> از قبل ثبت شده."
+
+
+def channel_usage_text(lang: str = "fa") -> str:
+    if lang == "en":
+        return (
+            "Usage: <code>/addchannel @channelusername</code> or "
+            "<code>/removechannel @channelusername</code>"
+        )
     return (
         "استفاده: <code>/addchannel @channelusername</code> یا "
         "<code>/removechannel @channelusername</code>"

@@ -51,11 +51,12 @@
 ├─ server.py             # Flask: /webhook، /trigger_news، /health، /set_webhook
 ├─ main.py               # یک اجرای خبر: fetch → filter → summarize → deliver → expire
 ├─ storage.py            # SQLite/Postgres: users، channels، news_messages، sent_items، settings
-├─ telegram_sender.py    # Bot API، HTML، retry، وبهوک و دستورهای فارسی
+├─ telegram_sender.py    # Bot API، HTML، retry، وبهوک و دستورهای دوزبانه (fa/en)
 ├─ analyzer.py           # Gemini (fa/en)، triage، summarize، سهمیه و retry
 ├─ fetcher.py            # منابع RSS/GitHub/HN + استخراج متن کامل
 ├─ filter.py             # Stage 1: dedup، تازگی، امتیازدهی اولیه
 ├─ channels_store.py     # نرمال‌سازی نام کانال + وضعیت عضویت
+├─ channels_config.py    # کانال‌های اجباری (username + لینک) — بدون نیاز به AI
 ├─ config.py             # تنظیمات از متغیرهای محیطی
 ├─ render.yaml           # Blueprint استقرار روی Render (دیسک، env، health)
 ├─ requirements-web.txt  # وابستگی‌های Render (شامل Flask و gunicorn)
@@ -137,18 +138,19 @@ Workflow فقط سرویس Render را بیدار می‌کند و `POST /trigge
 
 | دستور | چه کسی | کار |
 |---|---|---|
-| `/start` | همه | ثبت‌نام؛ بار اول پیام خوش‌آمد فارسی، بارهای بعد صفحهٔ تنظیمات با دکمه‌های اشتراک و راهنما |
+| `/start` | همه | ثبت‌نام؛ بار اول پیام خوش‌آمد به زبان کاربر، بارهای بعد صفحهٔ تنظیمات |
+| `/lang` | همه | انتخاب زبان با دکمه‌های «فارسی 🇮🇷» و «English 🇬🇧» |
 | `/subscribe` | همه | فعال‌کردن اشتراک خبر |
 | `/unsubscribe` | همه | غیرفعال‌کردن اشتراک خبر |
 | `/help` | همه | راهنما |
 | `/stats` | فقط ادمین | تعداد کل کاربران، مشترک‌ها و فعال‌ها در ۳۰ روز اخیر |
-| `/addchannel @channel` | فقط ادمین | افزودن کانال اجباری |
+| `/addchannel @channel` | فقط ادمین | افزودن کانال اجباری (روش پیشنهادی: `channels_config.py`) |
 | `/removechannel @channel` | فقط ادمین | حذف کانال اجباری |
 
 - **ادمین** یعنی `chat_id` شما برابر Secret `ADMIN_CHAT_ID` باشد. دستورهای مدیریتی فقط برای همین شناسه کار می‌کنند.
-- **جعبهٔ اشتراک** با دکمه‌های `toggle_subscription` و `help` هم کار می‌کند؛ نیازی به تایپ دستور نیست.
-- **عضویت اجباری**: اگر جدول `channels` خالی نباشد، هم ثبت‌نام و هم ارسال خبر با `getChatMember` بررسی می‌شود. **ربات باید در هر کانال ادمین باشد**؛ اگر نباشد آن کانال «عضو نیست» حساب می‌شود تا کاربر قفل نشود.
-- **زبان**: همهٔ متن‌ها و خلاصه‌ها فارسی هستند. مدل اگر انگلیسی بنویسد، پاسخ رد و با پرامپت سخت‌گیرانه دوباره درخواست می‌شود؛ در نهایت خلاصهٔ جایگزین فارسی ارسال می‌گردد.
+- **جعبهٔ اشتراک** با دکمه‌های `toggle_subscription`، `lang_menu` و `help` هم کار می‌کند؛ نیازی به تایپ دستور نیست.
+- **عضویت اجباری**: کانال اجباری `@aiceur_zero` در `channels_config.py` تعریف شده است (کانال‌های `/addchannel` هم اضافه می‌شوند). کاربر غیرعضو پیام عضویت با لینک کانال و دکمهٔ «✅ تایید عضویت» (`check_membership_aiceur_zero`) می‌گیرد و تا عضو نشدن ثبت‌نام نمی‌شود؛ با زدن دکمه عضویتش دوباره بررسی می‌شود. **ربات باید در کانال ادمین باشد**؛ اگر نباشد بررسی آن کانال رد می‌شود تا کاربر قفل نشود.
+- **زبان**: هنگام `/start` زبان از `language_code` تلگرام تشخیص داده می‌شود (هر کد `fa*` فارسی، بقیه انگلیسی، بدون کد فارسی). با `/lang` قابل تغییر است و در ستون `language` دیتابیس ذخیره می‌شود. هر کاربر خلاصهٔ خبر را به زبان خودش می‌گیرد و پرامپت AI هم همان زبان را الزام می‌کند.
 - **ضد اسپم**: بیش از ۳ پیام در دقیقه = ۵ دقیقه سکوت. ادمین معاف است.
 - **ارسال**: هر کسی `/start` بزند و مشترک بماند گیرنده است؛ با هر اجرا (ساعت‌های تعیین‌شده) خبرهای تازه می‌رسند و هر خبر ۲۴ ساعت بعد حذف می‌شود.
 
@@ -161,7 +163,9 @@ Workflow فقط سرویس Render را بیدار می‌کند و `POST /trigge
 | منبع جدید اضافه کنم | `config.py` → `RSS_SECURITY_FEEDS` / `RSS_AI_FEEDS` / `GITHUB_KEYWORDS` / `HN_QUERIES` |
 | وزن منابع یا کلیدواژه‌ها را عوض کنم | `config.py` → `SOURCE_WEIGHTS` / `KEYWORD_WEIGHTS` |
 | پرامپت خلاصه یا Triage را تغییر دهم | `analyzer.py` → `SUMMARIZE_SYSTEM_PROMPT(_EN)` / `TRIAGE_SYSTEM_PROMPT` |
-| متن خوش‌آمد، راهنما یا انتخاب زبان را عوض کنم | `config.py` → `welcome_text()` / `help_text()` / `choose_language_text()` |
+| متن خوش‌آمد، راهنما، تنظیمات یا دکمه‌ها را عوض کنم | `config.py` → `welcome_text()` / `help_text()` / `settings_text()` / `join_required_text()` |
+| کانال اجباری اضافه/حذف کنم | `channels_config.py` → `REQUIRED_CHANNELS` (username + link) |
+| تشخیص زبان یا زبان پیش‌فرض را عوض کنم | `config.py` → `detect_language()` / `SUPPORTED_LANGS` / `DEFAULT_LANG` |
 | گیرنده‌ها را عوض کنم | Secret `TELEGRAM_CHAT_IDS` (کاربران `/start` خودکار اضافه می‌شوند) |
 | تعداد خلاصه در هر اجرا | `MAX_ITEMS_PER_RUN` (پیش‌فرض ۱۰) |
 | سقف فراخوانی AI | `MAX_AI_CALLS_PER_RUN` / `DAILY_AI_BUDGET` |

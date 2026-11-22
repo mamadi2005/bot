@@ -675,57 +675,86 @@ class TelegramSender:
 
 
 # --------------------------------------------------------------------------- #
-# Onboarding / commands (Persian-only UX)
+# Onboarding / commands (Persian + English)
 # --------------------------------------------------------------------------- #
-WELCOME_TEXT = (
-    'سلام! 👋 به ربات اخبار خوش آمدید.\n'
-    'شما با موفقیت ثبت‌نام شدید. ✅\n'
-    'اشتراک اخبار: فعال\n'
-    '🌐 زبان: فارسی'
-)
-HINT_TEXT = 'برای مشاهده تنظیمات /start را بزنید'
-HELP_TEXT = (
-    '<b>راهنمای ربات اخبار</b>\n\n'
-    '/start — نمایش تنظیمات و وضعیت اشتراک\n'
-    '/subscribe — فعال‌کردن اشتراک اخبار\n'
-    '/unsubscribe — غیرفعال‌کردن اشتراک اخبار\n'
-    '/help — همین راهنما\n\n'
-    'اخبار جدید در ساعت‌های ۰۸:۰۰، ۱۲:۰۰، ۱۶:۰۰، ۲۰:۰۰ و ۰۰:۰۰ (به وقت تهران) ارسال می‌شود '
-    'و هر خبر حدود ۲۴ ساعت بعد حذف می‌شود.'
-)
-
-
 def _is_admin(chat_id: int | str) -> bool:
     if not config.ADMIN_CHAT_ID:
         return False
     return str(chat_id) == str(config.ADMIN_CHAT_ID)
 
 
-def _settings_keyboard(subscribed: bool) -> dict:
-    toggle = 'غیرفعال‌کردن اشتراک' if subscribed else 'فعال‌کردن اشتراک'
+def _subscribed(user: dict | None) -> bool:
+    return bool(user and int(user.get("is_subscribed") or 0) == 1)
+
+
+def _settings_keyboard(lang: str, subscribed: bool) -> dict:
     return {
         "inline_keyboard": [
-            [{"text": toggle, "callback_data": "toggle_subscription"}],
-            [{"text": "راهنما", "callback_data": "help"}],
+            [
+                {
+                    "text": config.toggle_subscription_text(lang, subscribed),
+                    "callback_data": "toggle_subscription",
+                }
+            ],
+            [{"text": config.language_button_text(lang), "callback_data": "lang_menu"}],
+            [{"text": config.help_button_text(lang), "callback_data": "help"}],
         ]
     }
 
 
-def _join_keyboard(channels: list[str]) -> dict:
-    from channels_store import join_url
-
+def _language_keyboard() -> dict:
     return {
         "inline_keyboard": [
-            [{"text": f"📢 {channel}", "url": join_url(channel)}]
-            for channel in channels
+            [
+                {"text": "فارسی 🇮🇷", "callback_data": "set_lang:fa"},
+                {"text": "English 🇬🇧", "callback_data": "set_lang:en"},
+            ]
         ]
     }
 
 
-def _subscription_text(user: dict | None) -> str:
-    active = bool(user and int(user.get("is_subscribed") or 0) == 1)
-    state = 'فعال ✅' if active else 'غیرفعال ⛔'
-    return f"<b>تنظیمات شما</b>\n\nوضعیت اشتراک: {state}\n🌐 زبان: فارسی"
+CONFIRM_CALLBACKS = {
+    "check_membership": "",
+    "check_membership_aiceur_zero": "@aiceur_zero",
+}
+
+
+def _join_keyboard(lang: str, entries: list[dict]) -> dict:
+    rows = [
+        [{"text": f"📢 {entry.get('name') or entry.get('username')}", "url": entry["link"]}]
+        for entry in entries
+    ]
+    callback = "check_membership"
+    if len(entries) == 1 and entries[0].get("username") == "@aiceur_zero":
+        callback = "check_membership_aiceur_zero"
+    rows.append([{"text": config.confirm_join_text(lang), "callback_data": callback}])
+    return {"inline_keyboard": rows}
+
+
+def _send_join_request(
+    sender: TelegramSender, chat_id: int | str, lang: str, entries: list[dict]
+) -> None:
+    sender.send_message(
+        chat_id,
+        config.join_required_text(lang, entries),
+        reply_markup=_join_keyboard(lang, entries),
+    )
+
+
+def _missing_channels(
+    sender: TelegramSender, channels, chat_id: int | str, only: str = ""
+) -> list[dict]:
+    """Pending channels; a gating error must never lock a user out."""
+    if channels is None or not channels.is_enabled():
+        return []
+    try:
+        missing = channels.missing_entries(sender, chat_id)
+    except Exception:
+        log.warning("membership check failed chat=%s", chat_id)
+        return []
+    if only:
+        return [entry for entry in missing if entry["username"] == only]
+    return missing
 
 
 def _handle_message(message: dict, sender: TelegramSender, users, channels) -> None:
@@ -746,11 +775,15 @@ def _handle_message(message: dict, sender: TelegramSender, users, channels) -> N
     from_user = message.get("from") or {}
     first_name = str(from_user.get("first_name") or "")
     username = str(from_user.get("username") or "")
+    detected = config.detect_language(from_user.get("language_code"))
+
+    user = users.get(chat_id)
+    lang = users.lang(chat_id) if user is not None else detected
 
     if not text.startswith("/"):
         # Plain text: nudge registered users to the settings screen.
-        if users.get(chat_id) is not None:
-            sender.send_message(chat_id, HINT_TEXT)
+        if user is not None:
+            sender.send_message(chat_id, config.hint_text(lang))
         return
 
     head, _, arg = text.partition(" ")
@@ -760,48 +793,54 @@ def _handle_message(message: dict, sender: TelegramSender, users, channels) -> N
         return
 
     if command == "/start":
-        existing = users.get(chat_id)
-        if existing is None:
-            if not admin and channels.channels:
-                missing = channels.missing_for(sender, chat_id)
+        if user is None:
+            if not admin:
+                missing = _missing_channels(sender, channels, chat_id)
                 if missing:
-                    sender.send_message(
-                        chat_id, config.join_required_text(), reply_markup=_join_keyboard(missing)
-                    )
+                    _send_join_request(sender, chat_id, lang, missing)
                     return
-            users.ensure(chat_id, first_name, username, now)
-            sender.send_message(chat_id, WELCOME_TEXT)
+            users.ensure(chat_id, first_name, username, now, language=detected)
+            sender.send_message(chat_id, config.welcome_text(users.lang(chat_id), chat_id))
             return
         users.ensure(chat_id, first_name, username, now)
-        user = users.get(chat_id) or existing
+        if not admin:
+            missing = _missing_channels(sender, channels, chat_id)
+            if missing:
+                _send_join_request(sender, chat_id, lang, missing)
+                return
+        subscribed = _subscribed(users.get(chat_id) or user)
         sender.send_message(
             chat_id,
-            _subscription_text(user),
-            reply_markup=_settings_keyboard(bool(int(user.get("is_subscribed") or 0))),
+            config.settings_text(lang, subscribed),
+            reply_markup=_settings_keyboard(lang, subscribed),
+        )
+        return
+
+    if command == "/lang":
+        if user is None:
+            sender.send_message(chat_id, config.register_first_text(lang))
+            return
+        sender.send_message(
+            chat_id, config.language_prompt_text(lang), reply_markup=_language_keyboard()
         )
         return
 
     if command in ("/subscribe", "/unsubscribe"):
-        if users.get(chat_id) is None:
-            sender.send_message(chat_id, 'ابتدا در ربات ثبت‌نام کنید: /start')
+        if user is None:
+            sender.send_message(chat_id, config.register_first_text(lang))
             return
-        if not admin and channels.channels:
-            missing = channels.missing_for(sender, chat_id)
+        if not admin:
+            missing = _missing_channels(sender, channels, chat_id)
             if missing:
-                sender.send_message(
-                    chat_id, config.join_required_text(), reply_markup=_join_keyboard(missing)
-                )
+                _send_join_request(sender, chat_id, lang, missing)
                 return
         subscribed = command == "/subscribe"
         users.set_subscribed(chat_id, subscribed)
-        sender.send_message(
-            chat_id,
-            'اشتراک اخبار فعال شد. ✅' if subscribed else 'اشتراک اخبار غیرفعال شد. ⛔',
-        )
+        sender.send_message(chat_id, config.subscription_changed_text(lang, subscribed))
         return
 
     if command == "/help":
-        sender.send_message(chat_id, HELP_TEXT)
+        sender.send_message(chat_id, config.help_text(lang))
         return
 
     if command not in ("/stats", "/addchannel", "/removechannel") or not admin:
@@ -811,36 +850,33 @@ def _handle_message(message: dict, sender: TelegramSender, users, channels) -> N
         result = users.stats(now)
         sender.send_message(
             chat_id,
-            f"<b>آمار کاربران</b>\nکل: {result['total']}\nمشترک: {result['subscribed']}\n"
-            f"فعال در {config.STATS_ACTIVE_DAYS} روز اخیر: {result['active']}",
+            config.stats_text(lang, result["total"], result["subscribed"], result["active"]),
         )
         return
 
     if not arg:
-        sender.send_message(chat_id, config.channel_usage_text())
+        sender.send_message(chat_id, config.channel_usage_text(lang))
         return
     if command == "/addchannel":
         added, channel = channels.add(arg)
         if not channel:
-            sender.send_message(chat_id, config.channel_usage_text())
+            sender.send_message(chat_id, config.channel_usage_text(lang))
         elif added:
-            sender.send_message(chat_id, config.channel_added_text(channel))
+            sender.send_message(chat_id, config.channel_added_text(lang, channel))
         else:
-            sender.send_message(
-                chat_id, f'ℹ️ کانال <code>{html.escape(channel)}</code> از قبل ثبت شده.'
-            )
+            sender.send_message(chat_id, config.channel_exists_text(lang, channel))
         return
 
     removed, channel = channels.remove(arg)
     if not channel:
-        sender.send_message(chat_id, config.channel_usage_text())
+        sender.send_message(chat_id, config.channel_usage_text(lang))
     elif removed:
-        sender.send_message(chat_id, config.channel_removed_text(channel))
+        sender.send_message(chat_id, config.channel_removed_text(lang, channel))
     else:
-        sender.send_message(chat_id, config.channel_missing_text(channel))
+        sender.send_message(chat_id, config.channel_missing_text(lang, channel))
 
 
-def _handle_callback(callback: dict, sender: TelegramSender, users) -> None:
+def _handle_callback(callback: dict, sender: TelegramSender, users, channels) -> None:
     data = str(callback.get("data") or "")
     callback_id = str(callback.get("id") or "")
     message = callback.get("message") or {}
@@ -850,28 +886,77 @@ def _handle_callback(callback: dict, sender: TelegramSender, users) -> None:
         return
 
     from_user = callback.get("from") or {}
+    first_name = str(from_user.get("first_name") or "")
+    username = str(from_user.get("username") or "")
+    detected = config.detect_language(from_user.get("language_code"))
     now = datetime.now(config.TEHRAN_TZ)
     user = users.get(chat_id)
+    lang = users.lang(chat_id) if user is not None else detected
+
+    if data in CONFIRM_CALLBACKS:
+        only = CONFIRM_CALLBACKS[data]
+        missing = _missing_channels(sender, channels, chat_id, only=only)
+        if missing:
+            sender.answer_callback_query(callback_id, config.join_again_text(lang))
+            _send_join_request(sender, chat_id, lang, missing)
+            return
+        created = False
+        if user is None:
+            users.ensure(chat_id, first_name, username, now, language=detected)
+            created = True
+        user = users.get(chat_id)
+        lang = users.lang(chat_id) if user is not None else detected
+        sender.answer_callback_query(callback_id, config.join_confirmed_text(lang))
+        if created:
+            sender.send_message(chat_id, config.welcome_text(lang, chat_id))
+        else:
+            sender.send_message(
+                chat_id,
+                config.settings_text(lang, _subscribed(user)),
+                reply_markup=_settings_keyboard(lang, _subscribed(user)),
+            )
+        return
+
     if user is None:
+        sender.answer_callback_query(callback_id, config.register_first_text(lang))
+        return
+
+    if data == "lang_menu":
         sender.answer_callback_query(callback_id)
+        sender.send_message(
+            chat_id, config.language_prompt_text(lang), reply_markup=_language_keyboard()
+        )
+        return
+
+    if data.startswith("set_lang:"):
+        code = data.split(":", 1)[1].strip().lower()
+        if not users.set_language(chat_id, code):
+            sender.answer_callback_query(callback_id)
+            return
+        lang = users.lang(chat_id)
+        sender.answer_callback_query(callback_id, config.language_saved_text(lang))
+        sender.send_message(
+            chat_id,
+            config.settings_text(lang, _subscribed(user)),
+            reply_markup=_settings_keyboard(lang, _subscribed(user)),
+        )
         return
 
     if data == "help":
-        sender.answer_callback_query(callback_id, 'راهنما ارسال شد.')
-        sender.send_message(chat_id, HELP_TEXT)
+        sender.answer_callback_query(callback_id, "✅")
+        sender.send_message(chat_id, config.help_text(lang))
         return
 
     if data == "toggle_subscription":
-        subscribed = not bool(int(user.get("is_subscribed") or 0))
+        subscribed = not _subscribed(user)
         users.set_subscribed(chat_id, subscribed)
         sender.answer_callback_query(
-            callback_id,
-            'اشتراک فعال شد. ✅' if subscribed else 'اشتراک غیرفعال شد. ⛔',
+            callback_id, config.subscription_changed_text(lang, subscribed)
         )
         sender.send_message(
             chat_id,
-            _subscription_text({**user, "is_subscribed": 1 if subscribed else 0}),
-            reply_markup=_settings_keyboard(subscribed),
+            config.settings_text(lang, subscribed),
+            reply_markup=_settings_keyboard(lang, subscribed),
         )
         return
 
@@ -887,7 +972,7 @@ def handle_updates(
             update_id = int(update.get("update_id") or 0)
             last_update_id = max(last_update_id, update_id)
             if update.get("callback_query"):
-                _handle_callback(update["callback_query"], sender, users)
+                _handle_callback(update["callback_query"], sender, users, channels)
                 continue
             message = update.get("message")
             if message:
@@ -900,3 +985,4 @@ def handle_updates(
         except Exception:
             log.exception("failed to save registry")
     return last_update_id
+

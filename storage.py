@@ -7,6 +7,7 @@ UTC ISO-8601 strings, which sort lexicographically.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import threading
@@ -16,12 +17,14 @@ from pathlib import Path
 
 import config
 
+log = logging.getLogger(__name__)
+
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS users (
         chat_id TEXT PRIMARY KEY,
         first_name TEXT NOT NULL DEFAULT '',
         username TEXT NOT NULL DEFAULT '',
-        lang TEXT NOT NULL DEFAULT '',
+        language TEXT NOT NULL DEFAULT 'fa',
         is_subscribed INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL,
         last_seen TEXT NOT NULL,
@@ -123,6 +126,33 @@ class Database:
                         cur.execute(statement)
             if self.backend == "sqlite":
                 conn.commit()
+        self._migrate()
+
+    def _columns(self, table: str) -> set[str]:
+        conn = self.connect()
+        with self._lock:
+            if self.backend == "sqlite":
+                rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+                return {str(row["name"]) for row in rows}
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = %s",
+                    (table,),
+                )
+                return {str(row["column_name"]) for row in cur.fetchall()}
+
+    def _migrate(self) -> None:
+        """Upgrade databases created before the multi-language schema."""
+        columns = self._columns("users")
+        if "language" in columns:
+            return
+        self.execute("ALTER TABLE users ADD COLUMN language TEXT NOT NULL DEFAULT 'fa'")
+        if "lang" in columns:
+            self.execute(
+                "UPDATE users SET language = lang WHERE lang IN ('fa', 'en')"
+            )
+            log.info("migrated users.lang -> users.language")
 
     # -- queries ------------------------------------------------------- #
     def execute(self, sql: str, params: tuple | list = ()) -> int:
@@ -243,7 +273,9 @@ class UserStore:
 
     def lang_of(self, chat_id: int | str) -> str:
         user = self.get(chat_id)
-        return str(user.get("lang") or "") if user else ""
+        if not user:
+            return ""
+        return str(user.get("language") or user.get("lang") or "")
 
     def lang(self, chat_id: int | str, default: str | None = None) -> str:
         value = self.lang_of(chat_id)
@@ -262,6 +294,7 @@ class UserStore:
         first_name: str = "",
         username: str = "",
         now: datetime | None = None,
+        language: str = "",
     ) -> tuple[dict | None, bool]:
         key = _key(chat_id)
         if key is None or self.read_only:
@@ -269,13 +302,14 @@ class UserStore:
         stamp = iso(now)
         clean_name = (first_name or "").strip()[:64]
         clean_username = (username or "").lstrip("@")[:32]
+        initial_lang = language if language in config.SUPPORTED_LANGS else config.DEFAULT_LANG
         existing = self.get(key)
         if existing is None:
             self.db.execute(
-                "INSERT INTO users (chat_id, first_name, username, lang, is_subscribed, "
-                "created_at, last_seen) VALUES (?, ?, ?, '', 1, ?, ?) "
+                "INSERT INTO users (chat_id, first_name, username, language, is_subscribed, "
+                "created_at, last_seen) VALUES (?, ?, ?, ?, 1, ?, ?) "
                 "ON CONFLICT(chat_id) DO NOTHING",
-                (key, clean_name, clean_username, stamp, stamp),
+                (key, clean_name, clean_username, initial_lang, stamp, stamp),
             )
             return self.get(key), True
         self.db.execute(
@@ -285,11 +319,20 @@ class UserStore:
         )
         return self.get(key), False
 
-    def set_lang(self, chat_id: int | str, lang: str) -> bool:
+    def set_language(self, chat_id: int | str, language: str) -> bool:
         key = _key(chat_id)
-        if key is None or lang not in config.SUPPORTED_LANGS or self.read_only:
+        if key is None or language not in config.SUPPORTED_LANGS or self.read_only:
             return False
-        return self.db.execute("UPDATE users SET lang = ? WHERE chat_id = ?", (lang, key)) > 0
+        return (
+            self.db.execute(
+                "UPDATE users SET language = ? WHERE chat_id = ?", (language, key)
+            )
+            > 0
+        )
+
+    def set_lang(self, chat_id: int | str, lang: str) -> bool:
+        """Backwards-compatible alias for :meth:`set_language`."""
+        return self.set_language(chat_id, lang)
 
     def set_subscribed(self, chat_id: int | str, subscribed: bool) -> bool:
         key = _key(chat_id)
@@ -416,19 +459,68 @@ class ChannelStore:
             return True, channel
         return False, channel
 
-    def missing_for(self, sender, chat_id: int | str) -> list[str]:
+    def configured(self) -> list[dict]:
+        """Gating list = ``channels_config.REQUIRED_CHANNELS`` + DB channels.
+
+        Each entry is ``{"username": "@name", "name": "@Name", "link": url}``.
+        The config file is the recommended way to add channels because it also
+        carries the invite link; rows added with ``/addchannel`` are merged in
+        with a derived ``https://t.me/...`` link.
+        """
+        from channels_config import REQUIRED_CHANNELS
+        from channels_store import join_url, normalize_channel
+
+        entries: list[dict] = []
+        seen: set[str] = set()
+        for raw in REQUIRED_CHANNELS or []:
+            if isinstance(raw, dict):
+                username = raw.get("username") or raw.get("channel") or ""
+                link = str(raw.get("link") or "").strip()
+            else:
+                username, link = str(raw), ""
+            channel = normalize_channel(str(username))
+            if not channel or channel in seen:
+                continue
+            seen.add(channel)
+            name = str(raw.get("name") or username).strip() or channel
+            entries.append(
+                {"username": channel, "name": name, "link": link or join_url(channel)}
+            )
+        for channel in self.channels:
+            if channel in seen:
+                continue
+            seen.add(channel)
+            entries.append(
+                {"username": channel, "name": channel, "link": join_url(channel)}
+            )
+        return entries
+
+    def is_enabled(self) -> bool:
+        return bool(self.configured())
+
+    def missing_entries(self, sender, chat_id: int | str) -> list[dict]:
+        """Configured channels the user has not joined yet."""
         from channels_store import MEMBER_STATUSES
 
-        missing = []
-        for channel in self.channels:
-            member = sender.get_chat_member(chat_id, channel)
-            status = (member or {}).get("status")
+        missing: list[dict] = []
+        for entry in self.configured():
+            member = sender.get_chat_member(chat_id, entry["username"])
+            if member is None:
+                log.warning(
+                    "join check skipped channel=%s (bot must be an admin there)",
+                    entry["username"],
+                )
+                continue
+            status = str(member.get("status") or "").lower()
             if status in MEMBER_STATUSES:
                 continue
-            if status == "restricted" and (member or {}).get("is_member") is True:
+            if status == "restricted" and member.get("is_member") is True:
                 continue
-            missing.append(channel)
+            missing.append(entry)
         return missing
+
+    def missing_for(self, sender, chat_id: int | str) -> list[str]:
+        return [entry["username"] for entry in self.missing_entries(sender, chat_id)]
 
 
 # --------------------------------------------------------------------------- #

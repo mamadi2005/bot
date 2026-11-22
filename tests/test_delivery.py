@@ -40,6 +40,8 @@ class FakeTelegram(TelegramSender):
 
     def _post(self, method, payload, timeout=30):
         self.requests.append((method, payload.copy()))
+        if method == "getChatMember":
+            return Response(200, {"ok": True, "result": {"status": "member"}})
         if self.responses:
             return self.responses.pop(0)
         if method == "sendMessage":
@@ -201,6 +203,37 @@ class HybridDeliveryTests(unittest.TestCase):
                 {"messages": 0, "recipients": 0},
             )
         self.assertEqual(gate.sends(), [])
+
+    def test_each_user_gets_the_summary_in_their_own_language(self):
+        self.users.ensure(1, "U", "u", language="fa")
+        self.users.ensure(2, "U", "u", language="en")
+        item = make_item()
+        item.summaries = {
+            "fa": "<b>خلاصه فارسی درباره آسیب‌پذیری XSS در پنل مدیریت است.</b>",
+            "en": "<b>English summary about an XSS vulnerability in the admin panel.</b>",
+        }
+        item.summary_html = item.summaries["fa"]
+        with patch.object(config, "BROADCAST_DELAY", 0):
+            main.deliver_news(
+                [item],
+                self.news,
+                self.sender,
+                self.users,
+                self.channels,
+                self.now,
+                {"messages": 0, "recipients": 0},
+            )
+        by_chat = {payload["chat_id"]: payload["text"] for payload in self.sender.sends()}
+        self.assertIn("خلاصه فارسی", by_chat[1])
+        self.assertIn("۲۴ ساعت", by_chat[1])
+        self.assertIn("English summary", by_chat[2])
+        self.assertIn("24 hours", by_chat[2])
+
+    def test_recipient_languages_put_the_default_first(self):
+        self.users.ensure(1, "U", "u", language="en")
+        self.users.ensure(2, "U", "u", language="fa")
+        self.assertEqual(main._recipient_langs(self.users, [1, 2]), ["fa", "en"])
+        self.assertEqual(main._recipient_langs(self.users, [1]), ["en"])
 
     def test_no_recipients_logs_and_sends_nothing(self):
         with patch.object(config, "BROADCAST_DELAY", 0):

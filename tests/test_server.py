@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import channels_config
+
 TOKEN = "123456:TEST-TOKEN-FOR-TESTS"
 WEBHOOK_SECRET = "hook-secret"
 TRIGGER_TOKEN = "trigger-secret"
@@ -81,24 +83,34 @@ class ServerTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     # -- helpers ------------------------------------------------------- #
-    def _message(self, text: str, chat_id: int = 900, update_id: int = 1) -> dict:
+    def _message(
+        self, text: str, chat_id: int = 900, update_id: int = 1, language_code: str | None = None
+    ) -> dict:
+        sender = {"id": chat_id, "first_name": "Ali", "username": "ali"}
+        if language_code is not None:
+            sender["language_code"] = language_code
         return {
             "update_id": update_id,
             "message": {
                 "message_id": update_id,
                 "date": 0,
                 "chat": {"id": chat_id, "type": "private"},
-                "from": {"id": chat_id, "first_name": "Ali", "username": "ali"},
+                "from": sender,
                 "text": text,
             },
         }
 
-    def _callback(self, data: str, chat_id: int = 900, update_id: int = 2) -> dict:
+    def _callback(
+        self, data: str, chat_id: int = 900, update_id: int = 2, language_code: str | None = None
+    ) -> dict:
+        sender = {"id": chat_id, "first_name": "Ali"}
+        if language_code is not None:
+            sender["language_code"] = language_code
         return {
             "update_id": update_id,
             "callback_query": {
                 "id": f"cb-{update_id}",
-                "from": {"id": chat_id, "first_name": "Ali"},
+                "from": sender,
                 "data": data,
                 "message": {"message_id": 7, "chat": {"id": chat_id, "type": "private"}},
             },
@@ -152,7 +164,8 @@ class ServerTests(unittest.TestCase):
         self.assertIn("فعال ✅", text)
         keyboard = self.sent[-1]["markup"]["inline_keyboard"]
         self.assertEqual(keyboard[0][0]["callback_data"], "toggle_subscription")
-        self.assertEqual(keyboard[1][0]["callback_data"], "help")
+        self.assertEqual(keyboard[1][0]["callback_data"], "lang_menu")
+        self.assertEqual(keyboard[2][0]["callback_data"], "help")
 
     def test_unsubscribe_and_subscribe_commands(self):
         self._post_update(self._message("/start", update_id=1))
@@ -196,6 +209,131 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(
             self.server.db().query("SELECT is_subscribed FROM users")[0]["is_subscribed"], 1
         )
+
+    def test_start_detects_english_from_language_code(self):
+        self._post_update(self._message("/start", language_code="en-US"))
+        self.assertIn("Welcome to the news bot", self.sent[-1]["text"])
+        self.assertIn("Language: English", self.sent[-1]["text"])
+        row = self.server.db().query("SELECT language FROM users")[0]
+        self.assertEqual(row["language"], "en")
+
+    def test_start_with_persian_language_code_stays_persian(self):
+        self._post_update(self._message("/start", language_code="fa-IR"))
+        self.assertIn("به ربات اخبار خوش آمدید", self.sent[-1]["text"])
+        row = self.server.db().query("SELECT language FROM users")[0]
+        self.assertEqual(row["language"], "fa")
+
+    def test_lang_command_shows_both_languages_and_saves_the_choice(self):
+        self._post_update(self._message("/start", update_id=1))
+        self._post_update(self._message("/lang", update_id=2))
+        buttons = self.sent[-1]["markup"]["inline_keyboard"][0]
+        self.assertEqual([button["text"] for button in buttons], ["فارسی 🇮🇷", "English 🇬🇧"])
+        self.assertEqual(
+            [button["callback_data"] for button in buttons], ["set_lang:fa", "set_lang:en"]
+        )
+        self._post_update(self._callback("set_lang:en", update_id=3))
+        self.assertEqual(
+            self.server.db().query("SELECT language FROM users")[0]["language"], "en"
+        )
+        self.assertIn("Your settings", self.sent[-1]["text"])
+        self.assertIn("Language: English", self.sent[-1]["text"])
+
+    def test_channel_gating_join_message_and_confirm_callback(self):
+        state = {"member": False}
+        sent = self.sent
+
+        class GateSender:
+            def __init__(inner, token=None):
+                pass
+
+            def get_chat_member(inner, chat_id, channel):
+                return {"status": "member" if state["member"] else "left"}
+
+            def send_message(inner, chat_id, text, reply_markup=None, on_sent=None, warning=""):
+                sent.append({"chat_id": chat_id, "text": text, "markup": reply_markup})
+                return True
+
+            def answer_callback_query(inner, callback_id, text=""):
+                return True
+
+            def delete_message(inner, chat_id, message_id):
+                return True
+
+        required = [{"username": "@mynews", "link": "https://t.me/mynews"}]
+        with patch.object(self.server, "TelegramSender", GateSender), patch.object(
+            self.server.main, "TelegramSender", GateSender
+        ), patch.object(channels_config, "REQUIRED_CHANNELS", required):
+            self._post_update(self._message("/start", update_id=1))
+            self.assertEqual(len(sent), 1)
+            self.assertIn("zerobot", sent[0]["text"])
+            self.assertIn("https://t.me/mynews", sent[0]["text"])
+            keyboard = sent[0]["markup"]["inline_keyboard"]
+            self.assertEqual(keyboard[0][0]["url"], "https://t.me/mynews")
+            self.assertEqual(keyboard[-1][0]["callback_data"], "check_membership")
+            self.assertEqual(keyboard[-1][0]["text"], "✅ تایید عضویت")
+            self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM users")[0]["n"], 0)
+
+            # Clicking confirm while still outside the channel repeats the prompt.
+            self._post_update(self._callback("check_membership", update_id=2))
+            self.assertEqual(len(sent), 2)
+            self.assertIn("zerobot", sent[1]["text"])
+
+            state["member"] = True
+            self._post_update(self._callback("check_membership", update_id=3))
+            self.assertEqual(len(sent), 3)
+            self.assertIn("به ربات اخبار خوش آمدید", sent[2]["text"])
+            self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM users")[0]["n"], 1)
+
+    def test_aiceur_zero_is_the_required_channel(self):
+        usernames = [entry["username"] for entry in channels_config.REQUIRED_CHANNELS]
+        self.assertIn("@aiceur_zero", usernames)
+
+    def test_aiceur_zero_gating_uses_dedicated_callback_and_english_copy(self):
+        state = {"member": False}
+        sent = self.sent
+
+        class GateSender:
+            def __init__(inner, token=None):
+                pass
+
+            def get_chat_member(inner, chat_id, channel):
+                return {"status": "member" if state["member"] else "left"}
+
+            def send_message(inner, chat_id, text, reply_markup=None, on_sent=None, warning=""):
+                sent.append({"chat_id": chat_id, "text": text, "markup": reply_markup})
+                return True
+
+            def answer_callback_query(inner, callback_id, text=""):
+                return True
+
+            def delete_message(inner, chat_id, message_id):
+                return True
+
+        with patch.object(self.server, "TelegramSender", GateSender), patch.object(
+            self.server.main, "TelegramSender", GateSender
+        ):
+            self._post_update(self._message("/start", update_id=1, language_code="en"))
+            self.assertEqual(len(sent), 1)
+            self.assertIn("To use zerobot", sent[0]["text"])
+            self.assertIn("https://t.me/aiceur_zero", sent[0]["text"])
+            keyboard = sent[0]["markup"]["inline_keyboard"]
+            self.assertEqual(keyboard[0][0]["url"], "https://t.me/aiceur_zero")
+            self.assertEqual(keyboard[-1][0]["callback_data"], "check_membership_aiceur_zero")
+            self.assertEqual(keyboard[-1][0]["text"], "✅ I've Joined")
+            self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM users")[0]["n"], 0)
+
+            self._post_update(
+                self._callback("check_membership_aiceur_zero", update_id=2, language_code="en")
+            )
+            self.assertEqual(len(sent), 2)
+            self.assertIn("To use zerobot", sent[1]["text"])
+
+            state["member"] = True
+            self._post_update(
+                self._callback("check_membership_aiceur_zero", update_id=3, language_code="en")
+            )
+            self.assertIn("Welcome to the news bot", sent[-1]["text"])
+            self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM users")[0]["n"], 1)
 
     def test_unknown_callback_is_answered_without_a_message(self):
         self._post_update(self._message("/start", update_id=1))

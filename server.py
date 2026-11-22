@@ -93,6 +93,9 @@ def webhook(secret: str = ""):
         sender = TelegramSender(config.TELEGRAM_BOT_TOKEN)
         with _DB_LOCK:
             users, channels, _ = stores(db())
+            # Messages and callback_query updates both go through
+            # main.process_update -> handle_updates -> _handle_callback, which
+            # handles the join gate's `check_membership_aiceur_zero` callback.
             main.process_update(update, sender, users, channels)
         _state["updates"] += 1
     except Exception:  # noqa: BLE001

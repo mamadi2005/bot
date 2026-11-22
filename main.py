@@ -26,8 +26,6 @@ from telegram_sender import TelegramSender, handle_updates, sanitize_html
 
 log = logging.getLogger("main")
 
-PERSIAN_LANGS = ("fa",)
-
 
 # --------------------------------------------------------------------------- #
 # Logging
@@ -167,7 +165,7 @@ def process_updates(
 # --------------------------------------------------------------------------- #
 def _store_summaries(item: Item, texts: dict[str, str]) -> None:
     item.summaries = dict(texts)
-    item.summary_html = texts.get("fa") or next(iter(texts.values()), "")
+    item.summary_html = texts.get(config.DEFAULT_LANG) or next(iter(texts.values()), "")
 
 
 def _fallback(item: Item, lang: str) -> str:
@@ -182,10 +180,12 @@ def _analyze(
     langs: list[str],
     dry_run: bool = False,
 ) -> tuple[list[Item], bool]:
-    """Triage + summarize. Every delivered summary is enforced to be Persian."""
-    langs = [lang for lang in (langs or PERSIAN_LANGS) if lang in config.SUPPORTED_LANGS]
+    """Triage + summarize in every language the recipients use."""
+    langs = [
+        lang for lang in (langs or [config.DEFAULT_LANG]) if lang in config.SUPPORTED_LANGS
+    ]
     if not langs:
-        langs = ["fa"]
+        langs = [config.DEFAULT_LANG]
     if not candidates:
         return [], False
 
@@ -224,7 +224,7 @@ def _analyze(
             result = analyzer.summarize(item, lang)
             if result.status == "quota":
                 quota_exhausted = True
-                texts[lang] = normalize_persian(result.text or _fallback(item, lang))
+                texts[lang] = _fallback(item, lang)
                 continue
             if result.status == "skip":
                 if index == 0 and not texts:
@@ -263,6 +263,19 @@ def _analyze(
 # --------------------------------------------------------------------------- #
 # Delivery
 # --------------------------------------------------------------------------- #
+def _recipient_langs(users: UserStore, recipients: list[int]) -> list[str]:
+    """Every language a recipient asked for, with the default first."""
+    langs: list[str] = []
+    for chat_id in recipients:
+        lang = users.lang(chat_id)
+        if lang not in langs:
+            langs.append(lang)
+    if config.DEFAULT_LANG in langs:
+        langs.remove(config.DEFAULT_LANG)
+        langs.insert(0, config.DEFAULT_LANG)
+    return langs or [config.DEFAULT_LANG]
+
+
 def _recipients(users: UserStore, days: int = 0) -> list[int]:
     """Configured chat IDs (never gated) followed by every subscribed user."""
     ordered: list[str] = [str(value) for value in config.recipient_chat_ids()]
@@ -312,7 +325,7 @@ def deliver_news(
     # Membership is checked once per run, not once per article.
     gated: dict[int, bool] = {}
     for chat_id in recipients:
-        if not channels.channels or str(chat_id) in {str(value) for value in config.recipient_chat_ids()}:
+        if not channels.is_enabled() or str(chat_id) in {str(value) for value in config.recipient_chat_ids()}:
             gated[chat_id] = True
             continue
         try:
@@ -321,19 +334,25 @@ def deliver_news(
             gated[chat_id] = True  # never drop delivery because the gate errored
 
     blocked: set[int] = set()
-    lang = config.DEFAULT_LANG
 
     for item in approved:
-        text = item.summaries.get(lang) or item.summary_html
-        if not text:
+        if not item.summaries and not item.summary_html:
             continue
-        notice = config.news_expiry_warning(lang)
         delivered = 0
         for chat_id in recipients:
             if chat_id in blocked:
                 continue
             if not gated.get(chat_id, True):
                 continue
+            lang = users.lang(chat_id)
+            text = (
+                item.summaries.get(lang)
+                or item.summaries.get(config.DEFAULT_LANG)
+                or item.summary_html
+            )
+            if not text:
+                continue
+            notice = config.news_expiry_warning(lang)
             try:
                 sent = sender.send_message(
                     chat_id,
@@ -452,8 +471,10 @@ def run_news(
             used_today=used_today,
         )
 
+        recipients = _recipients(users)
+        langs = _recipient_langs(users, recipients)
         approved, quota_exhausted = _analyze(
-            candidates, no_ai, budget, stats, ["fa"], dry_run=dry_run
+            candidates, no_ai, budget, stats, langs, dry_run=dry_run
         )
         result["approved"] = len(approved)
 
@@ -462,11 +483,21 @@ def run_news(
         else:
             deliver_news(approved, store, sender, users, channels, now, stats, quota_exhausted)
             if config.ADMIN_CHAT_ID and stats["recipients"]:
-                summary = (
-                    f"✅ خبر جدید ارسال شد: {len(approved)} مورد به {stats['recipients']} کاربر."
-                    if approved
-                    else "⚠️ اجرای خبر تمام شد اما خبری ارسال نشد."
-                )
+                admin_lang = users.lang(config.ADMIN_CHAT_ID)
+                if approved:
+                    summary = (
+                        f"✅ {len(approved)} new item(s) sent to "
+                        f"{stats['recipients']} user(s)."
+                        if admin_lang == "en"
+                        else f"✅ خبر جدید ارسال شد: {len(approved)} مورد به "
+                        f"{stats['recipients']} کاربر."
+                    )
+                else:
+                    summary = (
+                        "⚠️ The run finished but nothing was sent."
+                        if admin_lang == "en"
+                        else "⚠️ اجرای خبر تمام شد اما خبری ارسال نشد."
+                    )
                 _notify_admin(sender, summary)
 
         store.set_state("ai_calls_date", today)

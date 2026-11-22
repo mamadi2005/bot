@@ -77,6 +77,18 @@ class StorageTestCase(unittest.TestCase):
         self.assertFalse(self.users.set_lang(9, "de"))
         self.assertEqual(self.users.lang(9), "en")
 
+    def test_language_is_stored_on_registration(self):
+        user, created = self.users.ensure(10, "U", "u", language="en")
+        self.assertTrue(created)
+        self.assertEqual(user["language"], "en")
+
+        other, _ = self.users.ensure(11, "U", "u", language="de")
+        self.assertEqual(other["language"], "fa")
+
+        self.assertTrue(self.users.set_language(11, "en"))
+        self.assertEqual(self.users.lang(11), "en")
+        self.assertFalse(self.users.set_language(11, "klingon"))
+
     def test_stats_counts_active_and_subscribed(self):
         self.users.ensure(1, "A", "a")
         self.users.ensure(2, "B", "b")
