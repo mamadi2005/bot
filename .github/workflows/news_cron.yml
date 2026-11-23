@@ -2,14 +2,13 @@ name: News Cron
 
 on:
   schedule:
-    # Backup trigger. The Render process also has its own in-process scheduler,
-    # so this only helps when Render is already awake. Tehran is UTC+03:30 all
-    # year: 08:00->04:30Z, 12:00->08:30Z, 16:00->12:30Z, 20:00->16:30Z, 00:00->20:30Z.
-    - cron: "35 4,8,12,16,20 * * *"
+    # External event trigger; slot-aware delivery runs at most once per slot.
+    # In NEWS_TEST_MODE it sends one historical item per 5-minute interval.
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Summarize without sending (Render returns a preview report)"
+        description: "Summarize without sending; details appear in Render logs"
         type: boolean
         default: false
 
@@ -31,16 +30,16 @@ jobs:
             echo "::error::Set the RENDER_BASE_URL secret, e.g. https://my-bot.onrender.com"
             exit 1
           fi
-          for attempt in $(seq 1 18); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 45 "$BASE_URL/health" || true)
+          for attempt in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$BASE_URL/health" || true)
             echo "attempt=$attempt health_http=$code"
             if [ "$code" = "200" ]; then exit 0; fi
-            sleep 8
+            sleep 10
           done
-          echo "::warning::Render did not wake in time; the in-process scheduler will cover this slot"
+          echo "::warning::Render did not wake in time"
           exit 0
 
-      - name: Trigger news run (slot-aware)
+      - name: Trigger news run and wait for completion
         env:
           BASE_URL: ${{ secrets.RENDER_BASE_URL }}
           TRIGGER_TOKEN: ${{ secrets.TRIGGER_TOKEN }}
@@ -50,18 +49,31 @@ jobs:
             echo "::error::Set the TRIGGER_TOKEN secret (must match Render's TRIGGER_TOKEN)."
             exit 1
           fi
-          set +e
-          response=$(curl -sS --max-time 300 -w '\n%{http_code}' \
-            -X POST "$BASE_URL/trigger_news?wait=1" \
+          response=$(curl -sS --max-time 30 -w '\n%{http_code}' \
+            -X POST "$BASE_URL/trigger_news" \
             -H "Authorization: Bearer $TRIGGER_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"dry_run\": $DRY_RUN}")
-          status=$?
           http=$(printf '%s' "$response" | tail -n1)
           body=$(printf '%s' "$response" | sed '$d')
-          echo "curl_exit=$status http=$http"
-          echo "body=$body"
-          if [ "$status" -ne 0 ] || [ "$http" != "200" ]; then
-            echo "::warning::Backup trigger did not run (http=$http); the in-process scheduler remains primary"
-            exit 0
+          echo "trigger_http=$http body=$body"
+          if [ "$http" != "202" ]; then
+            echo "::error::News trigger failed (http=$http)"
+            exit 1
           fi
+          for attempt in $(seq 1 60); do
+            status=$(curl -sS --max-time 20 \
+              -H "Authorization: Bearer $TRIGGER_TOKEN" \
+              "$BASE_URL/news_status")
+            echo "status_attempt=$attempt status=$status"
+            running=$(printf '%s' "$status" | jq -r '.running // false')
+            if [ "$running" = "false" ]; then
+              ok=$(printf '%s' "$status" | jq -r '.last_result.ok // false')
+              if [ "$ok" = "true" ]; then exit 0; fi
+              echo "::error::News job finished with an error"
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "::error::News job did not finish within five minutes"
+          exit 1

@@ -26,7 +26,6 @@ class ServerTests(unittest.TestCase):
         os.environ["ADMIN_CHAT_ID"] = ""
         os.environ["TELEGRAM_CHAT_IDS"] = ""
         os.environ["GEMINI_API_KEY"] = ""
-        os.environ["SCHEDULER_ENABLED"] = "false"
 
         import importlib
 
@@ -409,7 +408,11 @@ class ServerTests(unittest.TestCase):
         )
 
     def test_trigger_accepts_bearer_and_x_token(self):
-        with patch.object(self.server.main, "run_news", return_value={"ok": True, "messages": 0}) as run:
+        with patch.object(
+            self.server.main, "run_news", return_value={"ok": True, "messages": 0}
+        ) as run, patch.object(
+            self.server.scheduler, "run_due", return_value={"ok": True, "messages": 0}
+        ), patch.object(self.server.threading, "Thread") as thread:
             response = self.client.post(
                 "/trigger_news?wait=1",
                 json={"cleanup_only": True},
@@ -424,6 +427,37 @@ class ServerTests(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 202)
             self.assertTrue(response.get_json()["accepted"])
+            thread.assert_called_once()
+
+    def test_trigger_accepts_true_query_parameter_for_dry_run(self):
+        with patch.object(
+            self.server.main,
+            "run_news",
+            return_value={"ok": True, "dry_run": True, "approved": 1},
+        ) as run, patch.object(self.server.scheduler, "run_due") as run_due:
+            response = self.client.post(
+                "/trigger_news?dry_run=true&wait=true",
+                headers={"Authorization": f"Bearer {TRIGGER_TOKEN}"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["dry_run"])
+        run.assert_called_once_with(dry_run=True, cleanup_only=False, limit=0)
+        run_due.assert_not_called()
+
+    def test_string_false_does_not_enable_dry_run(self):
+        with patch.object(
+            self.server.scheduler,
+            "run_due",
+            return_value={"ok": True, "skipped": True},
+        ) as run_due, patch.object(self.server.main, "run_news") as run:
+            response = self.client.post(
+                "/trigger_news?wait=true",
+                json={"dry_run": "false"},
+                headers={"Authorization": f"Bearer {TRIGGER_TOKEN}"},
+            )
+        self.assertEqual(response.status_code, 200)
+        run.assert_not_called()
+        run_due.assert_called_once_with(limit=0)
 
     def test_trigger_reports_failures_with_500(self):
         with patch.object(
@@ -439,7 +473,9 @@ class ServerTests(unittest.TestCase):
 
     def test_news_status_requires_auth_and_reports(self):
         self.assertEqual(self.client.get("/news_status").status_code, 401)
-        with patch.object(self.server.main, "run_news", return_value={"ok": True}):
+        with patch.object(
+            self.server.scheduler, "run_due", return_value={"ok": True}
+        ):
             self.client.post(
                 "/trigger_news?wait=1", headers={"Authorization": f"Bearer {TRIGGER_TOKEN}"}
             )

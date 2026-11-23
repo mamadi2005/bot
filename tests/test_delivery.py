@@ -395,6 +395,38 @@ class HybridDeliveryTests(unittest.TestCase):
         self.assertEqual(result.counters["stale"], 0)
         self.assertEqual(result.items, [item])
 
+    def test_dry_run_logs_summary_and_does_not_send_or_write_run_state(self):
+        self.users.ensure(1, "U", "u")
+        item = make_item()
+        with patch.object(main, "open_database", return_value=self.db), patch.object(
+            main, "fetch_all", return_value=[item]
+        ), patch.object(
+            main, "prefilter", return_value=SimpleNamespace(items=[item])
+        ), patch.object(
+            main, "enrich_full_text"
+        ), patch.object(
+            main, "finalize_candidates", return_value=[item]
+        ), patch.object(
+            main, "_analyze", return_value=([item], False)
+        ), patch.object(
+            main, "_print_preview"
+        ), patch.object(
+            main, "deliver_news"
+        ) as deliver, self.assertLogs("main", level="INFO") as captured:
+            result = main.run_news(dry_run=True)
+
+        self.assertEqual(result["approved"], 1)
+        self.assertEqual(result["subscribed_users"], 1)
+        self.assertEqual(result["would_send_to"], 1)
+        self.assertEqual(result["users_sent"], 0)
+        deliver.assert_not_called()
+        self.assertIn(
+            "Dry Run Successful: Found 1 news items, would send to 1 subscribed users",
+            "\n".join(captured.output),
+        )
+        self.assertIn("Dry run mode: skipping Telegram send", "\n".join(captured.output))
+        self.assertEqual(self.db.query("SELECT key FROM settings"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

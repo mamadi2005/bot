@@ -302,6 +302,7 @@ def deliver_news(
 
     recipients = _recipients(users)
     stats["recipients"] = len(recipients)
+    delivered_users = stats.setdefault("delivered_users", set())
     if not recipients:
         log.warning("no recipients: set TELEGRAM_CHAT_IDS or have users send /start")
         return
@@ -345,6 +346,7 @@ def deliver_news(
             if sent:
                 delivered += 1
                 stats["messages"] += 1
+                delivered_users.add(chat_id)
             else:
                 blocked.add(chat_id)
                 users.set_subscribed(chat_id, False)
@@ -397,13 +399,22 @@ def run_news(
 ) -> dict:
     """Fetch, summarize and deliver one batch of news. Safe to call from threads."""
     started = time.monotonic()
-    stats = {"updates": 0, "messages": 0, "ai_calls": 0, "recipients": 0}
+    stats = {
+        "updates": 0,
+        "messages": 0,
+        "ai_calls": 0,
+        "recipients": 0,
+        "delivered_users": set(),
+    }
     result: dict = {
         "ok": True,
         "dry_run": dry_run,
         "fetched": 0,
         "approved": 0,
         "messages": 0,
+        "subscribed_users": 0,
+        "users_sent": 0,
+        "would_send_to": 0,
         "deleted": 0,
         "elapsed": 0.0,
         "error": "",
@@ -418,6 +429,9 @@ def run_news(
     try:
         db = open_database(database_url)
         users, channels, store = stores(db)
+        subscribed_users = len(users.chat_ids(subscribed_only=True))
+        result["subscribed_users"] = subscribed_users
+        log.info("Found %d subscribed users in database", subscribed_users)
         sender = None if dry_run else TelegramSender(config.TELEGRAM_BOT_TOKEN)
 
         if sender is not None:
@@ -430,6 +444,7 @@ def run_news(
         now = utc_now()
         today = now.astimezone(config.TEHRAN_TZ).date().isoformat()
 
+        log.info("Starting news fetch...")
         raw_items = fetch_all()
         filter_result = prefilter(raw_items, store.sent_hashes, now)
         candidates = filter_result.items
@@ -450,13 +465,27 @@ def run_news(
             used_today=used_today,
         )
 
+        if candidates:
+            log.info("Summarizing news for language: en")
         approved, quota_exhausted = _analyze(candidates, no_ai, budget, stats)
         result["approved"] = len(approved)
 
         if dry_run:
+            result["would_send_to"] = subscribed_users
+            log.info(
+                "Dry Run Successful: Found %d news items, would send to %d subscribed users",
+                len(approved),
+                subscribed_users,
+            )
+            log.info("Dry run mode: skipping Telegram send")
             _print_preview(approved)
         else:
             deliver_news(approved, store, sender, users, channels, now, stats, quota_exhausted)
+            result["users_sent"] = len(stats["delivered_users"])
+            if stats["delivered_users"]:
+                log.info("Successfully sent to %d users", result["users_sent"])
+            else:
+                log.info("No news messages sent")
             if config.ADMIN_CHAT_ID and stats["recipients"]:
                 if approved:
                     summary = (
@@ -467,10 +496,11 @@ def run_news(
                     summary = "⚠️ The run finished but nothing was sent."
                 _notify_admin(sender, summary)
 
-        store.set_state("ai_calls_date", today)
-        store.set_state("ai_calls_today", str(used_today + budget.used_this_run))
-        store.set_state("last_run_at", iso())
-        store.set_state("last_run_approved", str(len(approved)))
+        if not dry_run:
+            store.set_state("ai_calls_date", today)
+            store.set_state("ai_calls_today", str(used_today + budget.used_this_run))
+            store.set_state("last_run_at", iso())
+            store.set_state("last_run_approved", str(len(approved)))
         result["messages"] = stats["messages"]
     except Exception as exc:  # noqa: BLE001
         result.update(ok=False, error=redact(f"{exc.__class__.__name__}: {exc}")[:400])

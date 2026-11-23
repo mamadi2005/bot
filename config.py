@@ -99,8 +99,7 @@ TRIGGER_TOKEN = env_str("TRIGGER_TOKEN")
 PORT = env_int("PORT", 8080)
 # How long a news message lives before the cleanup pass deletes it.
 NEWS_TTL_HOURS = max(1, env_int("NEWS_TTL_HOURS", 24))
-# In-process scheduler inside the Render web process (disable in tests).
-SCHEDULER_ENABLED = env_bool("SCHEDULER_ENABLED", True)
+# External triggers decide when the slot-aware job is run.
 NEWS_TEST_MODE = env_bool("NEWS_TEST_MODE", False)
 NEWS_TEST_LOOKBACK_DAYS = max(1, env_int("NEWS_TEST_LOOKBACK_DAYS", 15))
 NEWS_TEST_INTERVAL_SECONDS = max(60, env_int("NEWS_TEST_INTERVAL_SECONDS", 300))

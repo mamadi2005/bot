@@ -1,10 +1,7 @@
-"""In-process, slot-aware news scheduler.
+"""Slot-aware news runs invoked by an external trigger.
 
-Delivery must not depend on a single external trigger: Render's free tier sleeps
-after inactivity, so a GitHub cron tick can land on a cold instance. This module
-decides whether a *scheduled slot* is still unserved and only then runs, which
-makes a late wake-up recover the missed slot exactly once instead of sending on
-every tick.
+This module contains no polling loop. A GitHub Actions request wakes Render and
+calls ``run_due``, which decides whether the current slot is unserved.
 
 Slots are 00:00, 08:00, 12:00, 16:00 and 20:00 Tehran time. ``main.run_news``
 has its own lock, so concurrent callers cannot double-send.
@@ -13,7 +10,6 @@ has its own lock, so concurrent callers cannot double-send.
 from __future__ import annotations
 
 import logging
-import threading
 from datetime import datetime, timedelta
 
 import config
@@ -28,12 +24,6 @@ SETTING_KEY = "last_slot_served"
 ATTEMPT_KEY = "slot_attempts"
 TEST_RUN_KEY = "last_test_run_at"
 MAX_SLOT_ATTEMPTS = 3
-
-_lock = threading.Lock()
-_test_run_lock = threading.Lock()
-_thread: threading.Thread | None = None
-_state: dict = {"started_at": None, "last_check": None, "last_slot": None, "last_result": None}
-
 
 def _slot_at_or_before(now: datetime) -> datetime | None:
     current = now.astimezone(config.TEHRAN_TZ)
@@ -104,16 +94,12 @@ def due_slot(store: NewsStore, now: datetime | None = None) -> datetime | None:
 
 
 def run_due(force: bool = False, db=None, **kwargs) -> dict:
-    """Run the news job only when a slot is due (or ``force``)."""
+    """Run a news job when called by an external trigger and a slot is due."""
     owned = db is None
     db = db or open_database()
-    test_lock_acquired = False
     try:
         store = NewsStore(db)
         if config.NEWS_TEST_MODE:
-            if not _test_run_lock.acquire(blocking=False):
-                return {"ok": True, "skipped": True, "reason": "test run in progress"}
-            test_lock_acquired = True
             now = utc_now()
             if not force and not test_run_due(store, now):
                 return {"ok": True, "skipped": True, "reason": "test interval not due"}
@@ -135,8 +121,6 @@ def run_due(force: bool = False, db=None, **kwargs) -> dict:
                 _mark_served(store, slot)
         return result
     finally:
-        if test_lock_acquired:
-            _test_run_lock.release()
         if owned:
             try:
                 db.connect().close()
@@ -158,78 +142,27 @@ def is_due(now: datetime | None = None) -> bool:
             pass
 
 
-def _loop() -> None:
-    while True:
-        try:
-            with _lock:
-                _state["last_check"] = datetime.now(config.TEHRAN_TZ).isoformat(timespec="seconds")
-            if is_due():
-                result = run_due()
-                with _lock:
-                    _state["last_slot"] = datetime.now(config.TEHRAN_TZ).isoformat(timespec="seconds")
-                    _state["last_result"] = {
-                        "ok": result.get("ok"),
-                        "approved": result.get("approved"),
-                        "messages": result.get("messages"),
-                        "error": result.get("error", ""),
-                        "skipped": result.get("skipped", False),
-                    }
-                log.info(
-                    "scheduled run ok=%s approved=%s messages=%s",
-                    result.get("ok"),
-                    result.get("approved"),
-                    result.get("messages"),
-                )
-        except Exception:  # noqa: BLE001
-            log.exception("scheduled news check failed")
-        poll_seconds = (
-            min(10, config.NEWS_TEST_INTERVAL_SECONDS)
-            if config.NEWS_TEST_MODE
-            else TICK_SECONDS
-        )
-        threading.Event().wait(poll_seconds)
-
-
-def start() -> bool:
-    """Start the background thread once; returns False when already running."""
-    global _thread
-    with _lock:
-        if _thread is not None and _thread.is_alive():
-            return False
-        _state["started_at"] = datetime.now(config.TEHRAN_TZ).isoformat(timespec="seconds")
-        _thread = threading.Thread(target=_loop, daemon=True, name="news-scheduler")
-        _thread.start()
-    if config.NEWS_TEST_MODE:
-        log.info(
-            "scheduler started test_mode=true lookback_days=%d interval_seconds=%d",
-            config.NEWS_TEST_LOOKBACK_DAYS,
-            config.NEWS_TEST_INTERVAL_SECONDS,
-        )
-    else:
-        log.info("scheduler started slots=%s", RUN_HOURS)
-    return True
-
-
 def status() -> dict:
-    with _lock:
-        payload = dict(_state)
+    db = open_database()
+    store = NewsStore(db)
     if config.NEWS_TEST_MODE:
-        db = open_database()
-        try:
-            previous = parse_iso(NewsStore(db).get_state(TEST_RUN_KEY, ""))
-        finally:
-            try:
-                db.connect().close()
-            except Exception:
-                pass
+        previous = parse_iso(store.get_state(TEST_RUN_KEY, ""))
         next_test = (
             previous + timedelta(seconds=config.NEWS_TEST_INTERVAL_SECONDS)
             if previous is not None
             else utc_now()
         )
-        payload["next_run"] = next_test.astimezone(config.TEHRAN_TZ).isoformat(
-            timespec="minutes"
-        )
+        last_run = previous
+        next_run = next_test
     else:
-        payload["next_run"] = next_run_at().isoformat(timespec="minutes")
-    return payload
+        last_run = _last_served(store)
+        next_run = next_run_at()
+    try:
+        db.connect().close()
+    except Exception:
+        log.exception("failed to close scheduler status database connection")
+    return {
+        "mode": "test" if config.NEWS_TEST_MODE else "scheduled",
+        "last_run": iso(last_run) if last_run else None,
+        "next_run": next_run.astimezone(config.TEHRAN_TZ).isoformat(timespec="minutes"),
+    }

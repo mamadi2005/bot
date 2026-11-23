@@ -14,12 +14,11 @@ target.
 from __future__ import annotations
 
 import hmac
-import json
 import logging
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request
 
@@ -30,11 +29,10 @@ from storage import open_database, stores
 from telegram_sender import TelegramSender
 
 log = logging.getLogger("server")
+main.setup_logging()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
-_scheduler_lock = threading.Lock()
-_scheduler_ready = False
 
 # Serialize DB access inside one process; the pipeline additionally guards runs.
 _DB_LOCK = threading.Lock()
@@ -47,23 +45,6 @@ def db():
     if _db is None:
         _db = open_database()
     return _db
-
-
-def ensure_scheduler() -> bool:
-    """Start the in-process scheduler once per worker (no-op afterwards)."""
-    global _scheduler_ready
-    if not config.SCHEDULER_ENABLED:
-        return False
-    with _scheduler_lock:
-        if _scheduler_ready:
-            return True
-        _scheduler_ready = scheduler.start()
-    return _scheduler_ready
-
-
-@app.before_request
-def _bootstrap() -> None:
-    ensure_scheduler()
 
 
 @app.get("/health")
@@ -138,8 +119,16 @@ def _trigger_authorized() -> bool:
     if not token:
         token = request.headers.get("X-Trigger-Token", "").strip()
     if not token:
-        token = (request.get_json(silent=True) or {}).get("token", "")
+        body = request.get_json(silent=True)
+        if isinstance(body, dict):
+            token = body.get("token", "")
     return hmac.compare_digest(str(token), str(expected))
+
+
+def _is_true(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _run_news_job(*, dry_run: bool, cleanup_only: bool, limit: int) -> None:
@@ -149,8 +138,7 @@ def _run_news_job(*, dry_run: bool, cleanup_only: bool, limit: int) -> None:
         if dry_run or cleanup_only:
             result = main.run_news(dry_run=dry_run, cleanup_only=cleanup_only, limit=limit)
         else:
-            # Slot-aware: a scheduling trigger also marks the slot as served,
-            # so the in-process scheduler will not repeat it.
+            # Slot-aware: frequent external triggers do not duplicate a slot.
             result = scheduler.run_due(limit=limit)
     except Exception as exc:  # noqa: BLE001
         _state["errors"] += 1
@@ -158,7 +146,9 @@ def _run_news_job(*, dry_run: bool, cleanup_only: bool, limit: int) -> None:
         result = {"ok": False, "error": main.redact(str(exc))[:300]}
     finally:
         _state["news_running"] = False
-        _state["last_news_run"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        _state["last_news_run"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+            "+00:00", "Z"
+        )
         _state["last_result"] = result
 
 
@@ -172,14 +162,16 @@ def trigger_news():
     if not _trigger_authorized():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    body = request.get_json(silent=True) or {}
-    dry_run = bool(body.get("dry_run")) or request.args.get("dry_run") == "1"
-    cleanup_only = bool(body.get("cleanup_only"))
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        body = {}
+    dry_run = _is_true(body.get("dry_run")) or _is_true(request.args.get("dry_run"))
+    cleanup_only = _is_true(body.get("cleanup_only"))
     try:
         limit = max(0, int(body.get("limit") or 0))
     except (TypeError, ValueError):
         limit = 0
-    wait = bool(body.get("wait")) or request.args.get("wait") == "1"
+    wait = _is_true(body.get("wait")) or _is_true(request.args.get("wait"))
 
     if _state.get("news_running"):
         return jsonify({"ok": False, "error": "a news run is already in progress", "running": True}), 409
@@ -189,7 +181,10 @@ def trigger_news():
         result = _state.get("last_result") or {"ok": False, "error": "no result"}
         return jsonify(result), (200 if result.get("ok") else 500)
 
-    _state["last_news_run"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    _state["last_news_run"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+    _state["news_running"] = True
     threading.Thread(
         target=_run_news_job,
         kwargs={"dry_run": dry_run, "cleanup_only": cleanup_only, "limit": limit},
@@ -242,5 +237,4 @@ if __name__ == "__main__":
     main.setup_logging(os.getenv("DEBUG", "").lower() in ("1", "true", "yes"))
     port = int(os.getenv("PORT", "8080"))
     log.info("starting webhook server on port=%d", port)
-    ensure_scheduler()
     app.run(host="0.0.0.0", port=port, threaded=True)
