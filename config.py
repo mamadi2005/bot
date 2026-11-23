@@ -98,7 +98,9 @@ TRIGGER_TOKEN = env_str("TRIGGER_TOKEN")
 # Render injects PORT; kept here so the CLI can report it consistently.
 PORT = env_int("PORT", 8080)
 # How long a news message lives before the cleanup pass deletes it.
-NEWS_TTL_HOURS = env_int("NEWS_TTL_HOURS", 24)
+NEWS_TTL_HOURS = max(1, env_int("NEWS_TTL_HOURS", 24))
+# In-process scheduler inside the Render web process (disable in tests).
+SCHEDULER_ENABLED = env_bool("SCHEDULER_ENABLED", True)
 
 
 
@@ -616,8 +618,9 @@ def help_text(lang: str = "fa") -> str:
             "/unsubscribe — turn news off\n"
             "/lang — change language\n"
             "/help — this help\n\n"
-            "News is delivered at 08:00, 12:00, 16:00, 20:00 and 00:00 (Tehran time) "
-            "and each message is deleted after about 24 hours."
+            "News is collected throughout the day and delivered in batches; "
+            "every news message is deleted after about 24 hours, while your "
+            "settings message stays."
         )
     return (
         "<b>راهنمای ربات اخبار</b>\n\n"
@@ -626,8 +629,8 @@ def help_text(lang: str = "fa") -> str:
         "/unsubscribe — غیرفعال‌کردن اشتراک اخبار\n"
         "/lang — تغییر زبان\n"
         "/help — همین راهنما\n\n"
-        "اخبار در ساعت‌های ۰۸:۰۰، ۱۲:۰۰، ۱۶:۰۰، ۲۰:۰۰ و ۰۰:۰۰ (به وقت تهران) ارسال می‌شود "
-        "و هر خبر حدود ۲۴ ساعت بعد حذف می‌شود."
+        "اخبار در طول روز جمع‌آوری و ارسال می‌شود؛ هر پیام خبری حدود ۲۴ ساعت بعد "
+        "حذف می‌شود اما پیام تنظیمات شما باقی می‌ماند."
     )
 
 
@@ -657,6 +660,18 @@ def language_button_text(lang: str) -> str:
 
 def help_button_text(lang: str) -> str:
     return "Help" if lang == "en" else "راهنما"
+
+
+def main_keyboard(lang: str = "fa") -> dict:
+    """Persistent reply keyboard so /start is always one tap away."""
+    return {
+        "keyboard": [
+            [{"text": "/start"}, {"text": "/lang"}],
+            [{"text": "/subscribe"}, {"text": "/unsubscribe"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
 
 
 def hint_text(lang: str) -> str:

@@ -25,6 +25,7 @@ from flask import Flask, jsonify, request
 
 import config
 import main
+import scheduler
 from storage import open_database, stores
 from telegram_sender import TelegramSender
 
@@ -32,6 +33,8 @@ log = logging.getLogger("server")
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
+_scheduler_lock = threading.Lock()
+_scheduler_ready = False
 
 # Serialize DB access inside one process; the pipeline additionally guards runs.
 _DB_LOCK = threading.Lock()
@@ -44,6 +47,23 @@ def db():
     if _db is None:
         _db = open_database()
     return _db
+
+
+def ensure_scheduler() -> bool:
+    """Start the in-process scheduler once per worker (no-op afterwards)."""
+    global _scheduler_ready
+    if not config.SCHEDULER_ENABLED:
+        return False
+    with _scheduler_lock:
+        if _scheduler_ready:
+            return True
+        _scheduler_ready = scheduler.start()
+    return _scheduler_ready
+
+
+@app.before_request
+def _bootstrap() -> None:
+    ensure_scheduler()
 
 
 @app.get("/health")
@@ -66,6 +86,7 @@ def health():
                 "last_news_run": _state["last_news_run"],
                 "webhook_configured": bool(config.WEBHOOK_SECRET),
                 "trigger_configured": bool(config.TRIGGER_TOKEN),
+                "scheduler": scheduler.status(),
             }
         ),
         (200 if ok else 503),
@@ -122,7 +143,12 @@ def _run_news_job(*, dry_run: bool, cleanup_only: bool, limit: int) -> None:
     _state["news_running"] = True
     _state["last_result"] = None
     try:
-        result = main.run_news(dry_run=dry_run, cleanup_only=cleanup_only, limit=limit)
+        if dry_run or cleanup_only:
+            result = main.run_news(dry_run=dry_run, cleanup_only=cleanup_only, limit=limit)
+        else:
+            # Slot-aware: a scheduling trigger also marks the slot as served,
+            # so the in-process scheduler will not repeat it.
+            result = scheduler.run_due(limit=limit)
     except Exception as exc:  # noqa: BLE001
         _state["errors"] += 1
         log.exception("triggered news run failed")
@@ -213,4 +239,5 @@ if __name__ == "__main__":
     main.setup_logging(os.getenv("DEBUG", "").lower() in ("1", "true", "yes"))
     port = int(os.getenv("PORT", "8080"))
     log.info("starting webhook server on port=%d", port)
+    ensure_scheduler()
     app.run(host="0.0.0.0", port=port, threaded=True)

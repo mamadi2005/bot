@@ -37,6 +37,8 @@ services:
         value: "24"
       - key: BROADCAST_DELAY
         value: "0.05"
+      - key: SCHEDULER_ENABLED
+        value: "true"
       - key: TZ
         value: Asia/Tehran
       - key: ENABLE_PDF

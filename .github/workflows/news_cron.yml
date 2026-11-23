@@ -2,13 +2,10 @@ name: News Cron
 
 on:
   schedule:
-    # Tehran is UTC+03:30 all year (Iran abolished DST in 2022).
-    # 08:00 Tehran -> 04:30 UTC
-    # 12:00 Tehran -> 08:30 UTC
-    # 16:00 Tehran -> 12:30 UTC
-    # 20:00 Tehran -> 16:30 UTC
-    # 00:00 Tehran -> 20:30 UTC (previous UTC day)
-    - cron: "30 4,8,12,16,20 * * *"
+    # Backup trigger. The Render process also has its own in-process scheduler,
+    # so this only helps when Render is already awake. Tehran is UTC+03:30 all
+    # year: 08:00->04:30Z, 12:00->08:30Z, 16:00->12:30Z, 20:00->16:30Z, 00:00->20:30Z.
+    - cron: "35 4,8,12,16,20 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -23,7 +20,7 @@ concurrency:
 jobs:
   trigger:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
       - name: Wake Render and wait for health
@@ -34,16 +31,16 @@ jobs:
             echo "::error::Set the RENDER_BASE_URL secret, e.g. https://my-bot.onrender.com"
             exit 1
           fi
-          for attempt in $(seq 1 12); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 "$BASE_URL/health" || true)
+          for attempt in $(seq 1 18); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 45 "$BASE_URL/health" || true)
             echo "attempt=$attempt health_http=$code"
             if [ "$code" = "200" ]; then exit 0; fi
-            sleep 10
+            sleep 8
           done
-          echo "::error::Render did not become healthy in time"
-          exit 1
+          echo "::warning::Render did not wake in time; the in-process scheduler will cover this slot"
+          exit 0
 
-      - name: Trigger news run
+      - name: Trigger news run (slot-aware)
         env:
           BASE_URL: ${{ secrets.RENDER_BASE_URL }}
           TRIGGER_TOKEN: ${{ secrets.TRIGGER_TOKEN }}
@@ -65,6 +62,6 @@ jobs:
           echo "curl_exit=$status http=$http"
           echo "body=$body"
           if [ "$status" -ne 0 ] || [ "$http" != "200" ]; then
-            echo "::error::News trigger failed (http=$http)"
-            exit 1
+            echo "::warning::Backup trigger did not run (http=$http); the in-process scheduler remains primary"
+            exit 0
           fi

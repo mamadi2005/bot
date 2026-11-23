@@ -688,18 +688,8 @@ def _subscribed(user: dict | None) -> bool:
 
 
 def _settings_keyboard(lang: str, subscribed: bool) -> dict:
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": config.toggle_subscription_text(lang, subscribed),
-                    "callback_data": "toggle_subscription",
-                }
-            ],
-            [{"text": config.language_button_text(lang), "callback_data": "lang_menu"}],
-            [{"text": config.help_button_text(lang), "callback_data": "help"}],
-        ]
-    }
+    """Persistent reply keyboard with /start, /lang and the subscription toggles."""
+    return config.main_keyboard(lang)
 
 
 def _language_keyboard() -> dict:
@@ -740,6 +730,12 @@ def _send_join_request(
         reply_markup=_join_keyboard(lang, entries),
     )
 
+
+def _show_main_keyboard(sender: TelegramSender, chat_id: int | str, lang: str) -> None:
+    """Re-attach the persistent /start keyboard without sending a message."""
+    sender.send_message(
+        chat_id, config.hint_text(lang), reply_markup=config.main_keyboard(lang)
+    )
 
 def _missing_channels(
     sender: TelegramSender, channels, chat_id: int | str, only: str = ""
@@ -783,7 +779,7 @@ def _handle_message(message: dict, sender: TelegramSender, users, channels) -> N
     if not text.startswith("/"):
         # Plain text: nudge registered users to the settings screen.
         if user is not None:
-            sender.send_message(chat_id, config.hint_text(lang))
+            sender.send_message(chat_id, config.hint_text(lang), reply_markup=config.main_keyboard(lang))
         return
 
     head, _, arg = text.partition(" ")
@@ -800,7 +796,12 @@ def _handle_message(message: dict, sender: TelegramSender, users, channels) -> N
                     _send_join_request(sender, chat_id, lang, missing)
                     return
             users.ensure(chat_id, first_name, username, now, language=detected)
-            sender.send_message(chat_id, config.welcome_text(users.lang(chat_id), chat_id))
+            new_lang = users.lang(chat_id)
+            sender.send_message(
+                chat_id,
+                config.welcome_text(new_lang, chat_id),
+                reply_markup=config.main_keyboard(new_lang),
+            )
             return
         users.ensure(chat_id, first_name, username, now)
         if not admin:
@@ -808,11 +809,12 @@ def _handle_message(message: dict, sender: TelegramSender, users, channels) -> N
             if missing:
                 _send_join_request(sender, chat_id, lang, missing)
                 return
-        subscribed = _subscribed(users.get(chat_id) or user)
+        sent_user = users.get(chat_id) or user
+        subscribed = _subscribed(sent_user)
         sender.send_message(
             chat_id,
             config.settings_text(lang, subscribed),
-            reply_markup=_settings_keyboard(lang, subscribed),
+            reply_markup=_settings_keyboard(lang, False),
         )
         return
 
@@ -836,11 +838,17 @@ def _handle_message(message: dict, sender: TelegramSender, users, channels) -> N
                 return
         subscribed = command == "/subscribe"
         users.set_subscribed(chat_id, subscribed)
-        sender.send_message(chat_id, config.subscription_changed_text(lang, subscribed))
+        sender.send_message(
+            chat_id,
+            config.subscription_changed_text(lang, subscribed),
+            reply_markup=_settings_keyboard(lang, False),
+        )
         return
 
     if command == "/help":
-        sender.send_message(chat_id, config.help_text(lang))
+        sender.send_message(
+            chat_id, config.help_text(lang), reply_markup=config.main_keyboard(lang)
+        )
         return
 
     if command not in ("/stats", "/addchannel", "/removechannel") or not admin:
@@ -908,13 +916,17 @@ def _handle_callback(callback: dict, sender: TelegramSender, users, channels) ->
         lang = users.lang(chat_id) if user is not None else detected
         sender.answer_callback_query(callback_id, config.join_confirmed_text(lang))
         if created:
-            sender.send_message(chat_id, config.welcome_text(lang, chat_id))
-        else:
             sender.send_message(
                 chat_id,
-                config.settings_text(lang, _subscribed(user)),
-                reply_markup=_settings_keyboard(lang, _subscribed(user)),
+                config.welcome_text(lang, chat_id),
+                reply_markup=_settings_keyboard(lang, False),
             )
+            return
+        sender.send_message(
+            chat_id,
+            config.settings_text(lang, _subscribed(user)),
+            reply_markup=_settings_keyboard(lang, False),
+        )
         return
 
     if user is None:
@@ -938,7 +950,7 @@ def _handle_callback(callback: dict, sender: TelegramSender, users, channels) ->
         sender.send_message(
             chat_id,
             config.settings_text(lang, _subscribed(user)),
-            reply_markup=_settings_keyboard(lang, _subscribed(user)),
+            reply_markup=_settings_keyboard(lang, False),
         )
         return
 
@@ -956,7 +968,7 @@ def _handle_callback(callback: dict, sender: TelegramSender, users, channels) ->
         sender.send_message(
             chat_id,
             config.settings_text(lang, subscribed),
-            reply_markup=_settings_keyboard(lang, subscribed),
+            reply_markup=_settings_keyboard(lang, False),
         )
         return
 

@@ -275,6 +275,31 @@ class HybridDeliveryTests(unittest.TestCase):
         self.assertEqual(stats["deleted"], 1)
         self.assertEqual(len(self.db.query("SELECT 1 FROM news_messages")), 0)
 
+    def test_settings_messages_are_never_queued_for_deletion(self):
+        from telegram_sender import _handle_message
+
+        self._post_chat = None
+        sent = []
+
+        class PlainSender:
+            def send_message(inner, chat_id, text, reply_markup=None, on_sent=None, warning=""):
+                sent.append({"text": text, "on_sent": on_sent})
+                return True
+
+            def answer_callback_query(inner, *args, **kwargs):
+                return True
+
+        self.channels.channels = []
+        message = {
+            "chat": {"id": 1, "type": "private"},
+            "from": {"id": 1, "first_name": "U", "language_code": "fa"},
+            "text": "/start",
+        }
+        _handle_message(message, PlainSender(), self.users, self.channels)
+        self.assertTrue(sent)
+        self.assertTrue(all(entry["on_sent"] is None for entry in sent))
+        self.assertEqual(self.db.query("SELECT COUNT(*) AS n FROM news_messages")[0]["n"], 0)
+
     def test_cleanup_batches_are_limited(self):
         for index in range(7):
             self.news.record_news_message(1, 100 + index, storage.utc_now() - timedelta(hours=25))

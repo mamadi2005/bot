@@ -18,7 +18,7 @@ TRIGGER_TOKEN = "trigger-secret"
 class ServerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls._tempdir = tempfile.TemporaryDirectory()
+        cls._tempdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         os.environ["DB_PATH"] = str(Path(cls._tempdir.name) / "server.db")
         os.environ["TELEGRAM_BOT_TOKEN"] = TOKEN
         os.environ["WEBHOOK_SECRET"] = WEBHOOK_SECRET
@@ -26,6 +26,7 @@ class ServerTests(unittest.TestCase):
         os.environ["ADMIN_CHAT_ID"] = ""
         os.environ["TELEGRAM_CHAT_IDS"] = ""
         os.environ["GEMINI_API_KEY"] = ""
+        os.environ["SCHEDULER_ENABLED"] = "false"
 
         import importlib
 
@@ -43,10 +44,14 @@ class ServerTests(unittest.TestCase):
             cls.server.db().connect().close()
         except Exception:
             pass
+        import shutil
+
+        shutil.rmtree(cls._tempdir.name, ignore_errors=True)
         cls._tempdir.cleanup()
 
     def setUp(self) -> None:
         # Each test starts from a clean user/channel set.
+        self.server._state["news_running"] = False
         db = self.server.db()
         db.execute("DELETE FROM users")
         db.execute("DELETE FROM channels")
@@ -152,20 +157,22 @@ class ServerTests(unittest.TestCase):
         self.assertIn("شما با موفقیت ثبت‌نام شدید. ✅", text)
         self.assertIn("اشتراک اخبار: فعال", text)
         self.assertIn("🌐 زبان: فارسی", text)
-        self.assertIsNone(self.sent[0]["markup"])
+        self.assertEqual(
+            self.sent[0]["markup"]["keyboard"][0][0]["text"], "/start"
+        )
         rows = self.server.db().query("SELECT chat_id, is_subscribed FROM users")
         self.assertEqual(rows, [{"chat_id": "900", "is_subscribed": 1}])
 
-    def test_returning_user_start_shows_settings_keyboard(self):
+    def test_returning_user_start_shows_settings_with_start_keyboard(self):
         self._post_update(self._message("/start", update_id=1))
         self._post_update(self._message("/start", update_id=2))
         text = self.sent[-1]["text"]
         self.assertIn("تنظیمات شما", text)
         self.assertIn("فعال ✅", text)
-        keyboard = self.sent[-1]["markup"]["inline_keyboard"]
-        self.assertEqual(keyboard[0][0]["callback_data"], "toggle_subscription")
-        self.assertEqual(keyboard[1][0]["callback_data"], "lang_menu")
-        self.assertEqual(keyboard[2][0]["callback_data"], "help")
+        keyboard = self.sent[-1]["markup"]
+        self.assertTrue(keyboard["is_persistent"])
+        self.assertEqual(keyboard["keyboard"][0][0]["text"], "/start")
+        self.assertEqual(keyboard["keyboard"][0][1]["text"], "/lang")
 
     def test_unsubscribe_and_subscribe_commands(self):
         self._post_update(self._message("/start", update_id=1))
@@ -422,6 +429,8 @@ class ServerTests(unittest.TestCase):
     def test_trigger_reports_failures_with_500(self):
         with patch.object(
             self.server.main, "run_news", return_value={"ok": False, "error": "boom"}
+        ), patch.object(
+            self.server.scheduler, "run_due", return_value={"ok": False, "error": "boom"}
         ):
             response = self.client.post(
                 "/trigger_news?wait=1", headers={"Authorization": f"Bearer {TRIGGER_TOKEN}"}
