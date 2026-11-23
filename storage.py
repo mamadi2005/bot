@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import tempfile
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -88,10 +89,29 @@ class Database:
         else:
             self.backend = "sqlite"
             path = dsn[len("sqlite:///"):] if dsn.startswith("sqlite:///") else dsn
-            self.path = Path(path or os.getenv("DB_PATH", "data/bot.db"))
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path = self._resolve_path(path or os.getenv("DB_PATH", "data/bot.db"))
         self._lock = threading.RLock()
         self._conn = None
+
+    @staticmethod
+    def _resolve_path(raw: str) -> Path:
+        """Fall back to a writable location when the configured dir is unusable.
+
+        Render's free plan has no disk, so /var/data is often missing and not
+        creatable by the app user. Without this the DB silently fails to open.
+        """
+        target = Path(raw)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            probe = target.parent / ".write_probe"
+            probe.write_bytes(b"")
+            probe.unlink()
+            return target
+        except OSError:
+            fallback = Path(tempfile.gettempdir()) / target.name
+            log.warning("DB path %s unusable, falling back to %s", target, fallback)
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            return fallback
 
     # -- connection ---------------------------------------------------- #
     def connect(self):

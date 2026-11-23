@@ -818,19 +818,24 @@ def _handle_message(message: dict, sender: TelegramSender, users, channels) -> N
         )
         return
 
-    if command == "/lang":
+    if command in ("/lang", "/subscribe", "/unsubscribe"):
         if user is None:
-            sender.send_message(chat_id, config.register_first_text(lang))
-            return
+            if not admin:
+                missing = _missing_channels(sender, channels, chat_id)
+                if missing:
+                    _send_join_request(sender, chat_id, lang, missing)
+                    return
+            users.ensure(chat_id, first_name, username, now, language=detected)
+            user = users.get(chat_id)
+            lang = users.lang(chat_id) if user is not None else detected
+
+    if command == "/lang":
         sender.send_message(
             chat_id, config.language_prompt_text(lang), reply_markup=_language_keyboard()
         )
         return
 
     if command in ("/subscribe", "/unsubscribe"):
-        if user is None:
-            sender.send_message(chat_id, config.register_first_text(lang))
-            return
         if not admin:
             missing = _missing_channels(sender, channels, chat_id)
             if missing:
@@ -930,8 +935,14 @@ def _handle_callback(callback: dict, sender: TelegramSender, users, channels) ->
         return
 
     if user is None:
-        sender.answer_callback_query(callback_id, config.register_first_text(lang))
-        return
+        missing = _missing_channels(sender, channels, chat_id)
+        if missing:
+            sender.answer_callback_query(callback_id, config.join_required_hint_text(lang))
+            _send_join_request(sender, chat_id, lang, missing)
+            return
+        users.ensure(chat_id, first_name, username, now, language=detected)
+        user = users.get(chat_id)
+        lang = users.lang(chat_id) if user is not None else detected
 
     if data == "lang_menu":
         sender.answer_callback_query(callback_id)

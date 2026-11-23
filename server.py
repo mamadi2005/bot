@@ -87,6 +87,9 @@ def health():
                 "webhook_configured": bool(config.WEBHOOK_SECRET),
                 "trigger_configured": bool(config.TRIGGER_TOKEN),
                 "scheduler": scheduler.status(),
+                "commit": (os.getenv("RENDER_GIT_COMMIT") or "")[:8],
+                "db_backend": db().backend,
+                "db_path": str(getattr(db(), "path", "")),
             }
         ),
         (200 if ok else 503),

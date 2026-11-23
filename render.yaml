@@ -32,7 +32,7 @@ services:
       - key: DATABASE_URL
         sync: false
       - key: DB_PATH
-        value: /var/data/bot.db
+        value: /tmp/bot.db
       - key: NEWS_TTL_HOURS
         value: "24"
       - key: BROADCAST_DELAY
@@ -43,7 +43,3 @@ services:
         value: Asia/Tehran
       - key: ENABLE_PDF
         value: "false"
-    disk:
-      name: bot-data
-      mountPath: /var/data
-      sizeGB: 1

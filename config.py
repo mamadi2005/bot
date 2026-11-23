@@ -686,6 +686,18 @@ def register_first_text(lang: str) -> str:
     return "ابتدا در ربات ثبت‌نام کنید: /start"
 
 
+def join_required_hint_text(lang: str) -> str:
+    if lang == "en":
+        return "Please join the channel first, then tap the confirm button."
+    return "ابتدا عضو کانال شوید، سپس دکمهٔ تایید را بزنید."
+
+
+def joined_and_registered_text(lang: str) -> str:
+    if lang == "en":
+        return "Registered ✅"
+    return "ثبت‌نام شد ✅"
+
+
 def language_prompt_text(lang: str) -> str:
     return choose_language_text(lang)
 

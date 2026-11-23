@@ -36,6 +36,11 @@ class StorageTestCase(unittest.TestCase):
             pass
 
     # -- schema -------------------------------------------------------- #
+    def test_unwritable_dir_falls_back_to_temp(self):
+        target = storage.Database._resolve_path(os.path.join("Z:\\missing-drive", "bot.db"))
+        self.assertTrue(Path(tempfile.gettempdir()).resolve() in target.resolve().parents)
+        self.assertEqual(target.name, "bot.db")
+
     def test_schema_is_created_idempotently(self):
         tables = {
             row["name"]

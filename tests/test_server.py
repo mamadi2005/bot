@@ -187,10 +187,15 @@ class ServerTests(unittest.TestCase):
             self.server.db().query("SELECT is_subscribed FROM users")[0]["is_subscribed"], 1
         )
 
-    def test_subscribe_without_registration_is_refused(self):
+    def test_subscribe_without_registration_auto_registers(self):
         self._post_update(self._message("/subscribe"))
-        self.assertIn("/start", self.sent[-1]["text"])
-        self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM users")[0]["n"], 0)
+        self.assertIn("فعال شد", self.sent[-1]["text"])
+        self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM users")[0]["n"], 1)
+
+    def test_button_without_registration_auto_registers(self):
+        self._post_update(self._callback("help", update_id=1))
+        self.assertIn("راهنمای ربات اخبار", self.sent[-1]["text"])
+        self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM users")[0]["n"], 1)
 
     def test_plain_text_nudges_registered_users_only(self):
         self._post_update(self._message("hello", chat_id=901, update_id=1))
