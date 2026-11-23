@@ -229,11 +229,63 @@ class HybridDeliveryTests(unittest.TestCase):
         self.assertIn("English summary", by_chat[2])
         self.assertIn("24 hours", by_chat[2])
 
-    def test_recipient_languages_put_the_default_first(self):
-        self.users.ensure(1, "U", "u", language="en")
-        self.users.ensure(2, "U", "u", language="fa")
-        self.assertEqual(main._recipient_langs(self.users, [1, 2]), ["fa", "en"])
-        self.assertEqual(main._recipient_langs(self.users, [1]), ["en"])
+    def test_all_supported_summary_languages_put_the_default_first(self):
+        self.assertEqual(main._summary_langs(), ["fa", "en"])
+
+    def test_language_change_during_analysis_uses_the_new_language_summary(self):
+        self.users.ensure(1, "U", "u", language="fa")
+        langs = main._summary_langs()
+        item = make_item()
+        item.summaries = {
+            "fa": "<b>خلاصه فارسی خبر امنیتی است.</b>",
+            "en": "<b>English security news summary.</b>",
+        }
+        item.summary_html = item.summaries["fa"]
+        self.users.set_language(1, "en")
+
+        with patch.object(config, "BROADCAST_DELAY", 0):
+            main.deliver_news(
+                [item],
+                self.news,
+                self.sender,
+                self.users,
+                self.channels,
+                self.now,
+                {"messages": 0, "recipients": 0},
+            )
+
+        self.assertEqual(langs, ["fa", "en"])
+        self.assertIn("English security news summary", self.sender.sends()[0]["text"])
+
+    def test_analysis_rejects_summaries_in_the_wrong_language(self):
+        item = make_item(content="Technical details about the vulnerability. " * 4)
+
+        class StubAnalyzer:
+            key_count = 1
+
+            def triage(self, candidates):
+                return candidates
+
+            def summarize(self, item, lang):
+                return SimpleNamespace(
+                    status="ok",
+                    text="این یک خلاصه فارسی درباره آسیب‌پذیری و روش بررسی آن است.",
+                )
+
+        with patch.object(main, "Analyzer", return_value=StubAnalyzer()):
+            approved, quota_exhausted = main._analyze(
+                [item],
+                no_ai=False,
+                budget=main.AIBudget(per_run=4, daily=4, used_today=0),
+                stats={},
+                langs=["fa", "en"],
+            )
+
+        self.assertEqual(approved, [item])
+        self.assertFalse(quota_exhausted)
+        self.assertIn("خلاصه فارسی", item.summaries["fa"])
+        self.assertNotIn("خلاصه فارسی", item.summaries["en"])
+        self.assertIn("Automatic summary", item.summaries["en"])
 
     def test_no_recipients_logs_and_sends_nothing(self):
         with patch.object(config, "BROADCAST_DELAY", 0):
@@ -313,6 +365,9 @@ class HybridDeliveryTests(unittest.TestCase):
         self.assertFalse(main.looks_persian(english))
         self.assertTrue(main.looks_persian(persian))
         self.assertFalse(main.looks_persian("<code>XSS</code> RCE SQLi"))
+        self.assertTrue(main.looks_english(english))
+        self.assertFalse(main.looks_english(persian))
+        self.assertFalse(main.looks_english("<code>XSS</code> RCE SQLi"))
 
     def test_non_persian_summary_falls_back_when_delivered(self):
         english = "<b>This is a purely English summary about an XSS vulnerability in the panel.</b>"

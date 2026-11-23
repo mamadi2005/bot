@@ -85,16 +85,30 @@ _PERSIAN = re.compile(r"[\u0600-\u06FF]")
 _LATIN = re.compile(r"[A-Za-z]")
 
 
-def persian_share(text: str) -> float:
+def _script_counts(text: str) -> tuple[int, int]:
     plain = re.sub(r"<[^>]*>", " ", text or "")
     plain = re.sub(r"https?://\S+", " ", plain)
-    persian = len(_PERSIAN.findall(plain))
-    latin = len(_LATIN.findall(plain))
-    return 0.0 if persian + latin == 0 else persian / (persian + latin)
+    return len(_PERSIAN.findall(plain)), len(_LATIN.findall(plain))
+
+
+def _script_shares(text: str) -> tuple[float, float]:
+    persian, latin = _script_counts(text)
+    total = persian + latin
+    return (0.0, 0.0) if total == 0 else (persian / total, latin / total)
+
+
+def persian_share(text: str) -> float:
+    return _script_shares(text)[0]
 
 
 def looks_persian(text: str) -> bool:
-    return len(_PERSIAN.findall(text or "")) >= 30 and persian_share(text) >= 0.45
+    persian, _ = _script_counts(text)
+    return persian >= 30 and persian_share(text) >= 0.45
+
+
+def looks_english(text: str) -> bool:
+    _, latin = _script_counts(text)
+    return latin >= 30 and _script_shares(text)[1] >= 0.45
 
 
 def normalize_persian(text: str) -> str:
@@ -232,17 +246,19 @@ def _analyze(
                     break
                 continue
             text = sanitize_html(result.text or "")
-            if lang == "fa":
-                if not looks_persian(text):
-                    rejected += 1
-                    log.warning(
-                        "non-Persian summary rejected source=%s persian_share=%.2f",
-                        item.source_label,
-                        persian_share(text),
-                    )
-                    text = _fallback(item, lang)
-                else:
-                    text = normalize_persian(text)
+            valid_language = looks_persian(text) if lang == "fa" else looks_english(text)
+            if not valid_language:
+                rejected += 1
+                share = persian_share(text) if lang == "fa" else _script_shares(text)[1]
+                log.warning(
+                    "wrong-language summary rejected lang=%s source=%s share=%.2f",
+                    lang,
+                    item.source_label,
+                    share,
+                )
+                text = _fallback(item, lang)
+            elif lang == "fa":
+                text = normalize_persian(text)
             texts[lang] = text or _fallback(item, lang)
         if skipped or not texts:
             continue
@@ -251,7 +267,7 @@ def _analyze(
 
     stats["ai_calls"] = budget.used_this_run
     log.info(
-        "analysis approved=%d ai_calls=%d rejected_non_persian=%d daily_remaining=%d",
+        "analysis approved=%d ai_calls=%d rejected_wrong_language=%d daily_remaining=%d",
         len(approved),
         budget.used_this_run,
         rejected,
@@ -263,13 +279,9 @@ def _analyze(
 # --------------------------------------------------------------------------- #
 # Delivery
 # --------------------------------------------------------------------------- #
-def _recipient_langs(users: UserStore, recipients: list[int]) -> list[str]:
-    """Every language a recipient asked for, with the default first."""
-    langs: list[str] = []
-    for chat_id in recipients:
-        lang = users.lang(chat_id)
-        if lang not in langs:
-            langs.append(lang)
+def _summary_langs() -> list[str]:
+    """All supported languages, so mid-run preference changes still match."""
+    langs = list(config.SUPPORTED_LANGS)
     if config.DEFAULT_LANG in langs:
         langs.remove(config.DEFAULT_LANG)
         langs.insert(0, config.DEFAULT_LANG)
@@ -345,11 +357,7 @@ def deliver_news(
             if not gated.get(chat_id, True):
                 continue
             lang = users.lang(chat_id)
-            text = (
-                item.summaries.get(lang)
-                or item.summaries.get(config.DEFAULT_LANG)
-                or item.summary_html
-            )
+            text = item.summaries.get(lang) or _fallback(item, lang)
             if not text:
                 continue
             notice = config.news_expiry_warning(lang)
@@ -472,7 +480,7 @@ def run_news(
         )
 
         recipients = _recipients(users)
-        langs = _recipient_langs(users, recipients)
+        langs = _summary_langs()
         approved, quota_exhausted = _analyze(
             candidates, no_ai, budget, stats, langs, dry_run=dry_run
         )
