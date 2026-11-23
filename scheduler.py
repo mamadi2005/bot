@@ -26,9 +26,11 @@ RUN_HOURS = (0, 8, 12, 16, 20)
 TICK_SECONDS = 60
 SETTING_KEY = "last_slot_served"
 ATTEMPT_KEY = "slot_attempts"
+TEST_RUN_KEY = "last_test_run_at"
 MAX_SLOT_ATTEMPTS = 3
 
 _lock = threading.Lock()
+_test_run_lock = threading.Lock()
 _thread: threading.Thread | None = None
 _state: dict = {"started_at": None, "last_check": None, "last_slot": None, "last_result": None}
 
@@ -81,6 +83,14 @@ def _bump_attempts(store: NewsStore, slot: datetime) -> int:
     return count
 
 
+def test_run_due(store: NewsStore, now: datetime | None = None) -> bool:
+    current = now or utc_now()
+    previous = parse_iso(store.get_state(TEST_RUN_KEY, ""))
+    return previous is None or (
+        current - previous
+    ).total_seconds() >= config.NEWS_TEST_INTERVAL_SECONDS
+
+
 def due_slot(store: NewsStore, now: datetime | None = None) -> datetime | None:
     """Return the oldest unserved slot, or ``None`` when everything is done."""
     current = now or utc_now()
@@ -97,8 +107,20 @@ def run_due(force: bool = False, db=None, **kwargs) -> dict:
     """Run the news job only when a slot is due (or ``force``)."""
     owned = db is None
     db = db or open_database()
+    test_lock_acquired = False
     try:
         store = NewsStore(db)
+        if config.NEWS_TEST_MODE:
+            if not _test_run_lock.acquire(blocking=False):
+                return {"ok": True, "skipped": True, "reason": "test run in progress"}
+            test_lock_acquired = True
+            now = utc_now()
+            if not force and not test_run_due(store, now):
+                return {"ok": True, "skipped": True, "reason": "test interval not due"}
+            store.set_state(TEST_RUN_KEY, iso(now))
+            kwargs["limit"] = 1
+            return main.run_news(**kwargs)
+
         slot = _slot_at_or_before(utc_now())
         if not force:
             if slot is None or due_slot(store, utc_now()) is None:
@@ -113,6 +135,8 @@ def run_due(force: bool = False, db=None, **kwargs) -> dict:
                 _mark_served(store, slot)
         return result
     finally:
+        if test_lock_acquired:
+            _test_run_lock.release()
         if owned:
             try:
                 db.connect().close()
@@ -123,7 +147,10 @@ def run_due(force: bool = False, db=None, **kwargs) -> dict:
 def is_due(now: datetime | None = None) -> bool:
     db = open_database()
     try:
-        return due_slot(NewsStore(db), now) is not None
+        store = NewsStore(db)
+        if config.NEWS_TEST_MODE:
+            return test_run_due(store, now)
+        return due_slot(store, now) is not None
     finally:
         try:
             db.connect().close()
@@ -155,7 +182,12 @@ def _loop() -> None:
                 )
         except Exception:  # noqa: BLE001
             log.exception("scheduled news check failed")
-        threading.Event().wait(TICK_SECONDS)
+        poll_seconds = (
+            min(10, config.NEWS_TEST_INTERVAL_SECONDS)
+            if config.NEWS_TEST_MODE
+            else TICK_SECONDS
+        )
+        threading.Event().wait(poll_seconds)
 
 
 def start() -> bool:
@@ -167,12 +199,37 @@ def start() -> bool:
         _state["started_at"] = datetime.now(config.TEHRAN_TZ).isoformat(timespec="seconds")
         _thread = threading.Thread(target=_loop, daemon=True, name="news-scheduler")
         _thread.start()
-    log.info("scheduler started slots=%s", RUN_HOURS)
+    if config.NEWS_TEST_MODE:
+        log.info(
+            "scheduler started test_mode=true lookback_days=%d interval_seconds=%d",
+            config.NEWS_TEST_LOOKBACK_DAYS,
+            config.NEWS_TEST_INTERVAL_SECONDS,
+        )
+    else:
+        log.info("scheduler started slots=%s", RUN_HOURS)
     return True
 
 
 def status() -> dict:
     with _lock:
         payload = dict(_state)
-    payload["next_run"] = next_run_at().isoformat(timespec="minutes")
+    if config.NEWS_TEST_MODE:
+        db = open_database()
+        try:
+            previous = parse_iso(NewsStore(db).get_state(TEST_RUN_KEY, ""))
+        finally:
+            try:
+                db.connect().close()
+            except Exception:
+                pass
+        next_test = (
+            previous + timedelta(seconds=config.NEWS_TEST_INTERVAL_SECONDS)
+            if previous is not None
+            else utc_now()
+        )
+        payload["next_run"] = next_test.astimezone(config.TEHRAN_TZ).isoformat(
+            timespec="minutes"
+        )
+    else:
+        payload["next_run"] = next_run_at().isoformat(timespec="minutes")
     return payload

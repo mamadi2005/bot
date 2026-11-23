@@ -675,7 +675,7 @@ class TelegramSender:
 
 
 # --------------------------------------------------------------------------- #
-# Onboarding / commands (Persian + English)
+# Onboarding / commands (English only)
 # --------------------------------------------------------------------------- #
 def _is_admin(chat_id: int | str) -> bool:
     if not config.ADMIN_CHAT_ID:
@@ -688,19 +688,8 @@ def _subscribed(user: dict | None) -> bool:
 
 
 def _settings_keyboard(lang: str, subscribed: bool) -> dict:
-    """Persistent reply keyboard with /start, /lang and the subscription toggles."""
+    """Persistent reply keyboard with /start, /help, and subscription toggles."""
     return config.main_keyboard(lang)
-
-
-def _language_keyboard() -> dict:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "فارسی 🇮🇷", "callback_data": "set_lang:fa"},
-                {"text": "English 🇬🇧", "callback_data": "set_lang:en"},
-            ]
-        ]
-    }
 
 
 CONFIRM_CALLBACKS = {
@@ -771,10 +760,8 @@ def _handle_message(message: dict, sender: TelegramSender, users, channels) -> N
     from_user = message.get("from") or {}
     first_name = str(from_user.get("first_name") or "")
     username = str(from_user.get("username") or "")
-    detected = config.detect_language(from_user.get("language_code"))
-
     user = users.get(chat_id)
-    lang = users.lang(chat_id) if user is not None else detected
+    lang = config.DEFAULT_LANG
 
     if not text.startswith("/"):
         # Plain text: nudge registered users to the settings screen.
@@ -795,7 +782,7 @@ def _handle_message(message: dict, sender: TelegramSender, users, channels) -> N
                 if missing:
                     _send_join_request(sender, chat_id, lang, missing)
                     return
-            users.ensure(chat_id, first_name, username, now, language=detected)
+            users.ensure(chat_id, first_name, username, now, language=lang)
             new_lang = users.lang(chat_id)
             sender.send_message(
                 chat_id,
@@ -804,6 +791,7 @@ def _handle_message(message: dict, sender: TelegramSender, users, channels) -> N
             )
             return
         users.ensure(chat_id, first_name, username, now)
+        users.set_subscribed(chat_id, True)
         if not admin:
             missing = _missing_channels(sender, channels, chat_id)
             if missing:
@@ -818,25 +806,19 @@ def _handle_message(message: dict, sender: TelegramSender, users, channels) -> N
         )
         return
 
-    if command in ("/lang", "/subscribe", "/unsubscribe"):
+    if command in ("/subscribe", "/unsubscribe"):
         if user is None:
             if not admin:
                 missing = _missing_channels(sender, channels, chat_id)
                 if missing:
                     _send_join_request(sender, chat_id, lang, missing)
                     return
-            users.ensure(chat_id, first_name, username, now, language=detected)
+            users.ensure(chat_id, first_name, username, now, language=lang)
             user = users.get(chat_id)
-            lang = users.lang(chat_id) if user is not None else detected
-
-    if command == "/lang":
-        sender.send_message(
-            chat_id, config.language_prompt_text(lang), reply_markup=_language_keyboard()
-        )
-        return
+            lang = config.DEFAULT_LANG
 
     if command in ("/subscribe", "/unsubscribe"):
-        if not admin:
+        if command == "/subscribe" and not admin:
             missing = _missing_channels(sender, channels, chat_id)
             if missing:
                 _send_join_request(sender, chat_id, lang, missing)
@@ -901,10 +883,9 @@ def _handle_callback(callback: dict, sender: TelegramSender, users, channels) ->
     from_user = callback.get("from") or {}
     first_name = str(from_user.get("first_name") or "")
     username = str(from_user.get("username") or "")
-    detected = config.detect_language(from_user.get("language_code"))
     now = datetime.now(config.TEHRAN_TZ)
     user = users.get(chat_id)
-    lang = users.lang(chat_id) if user is not None else detected
+    lang = config.DEFAULT_LANG
 
     if data in CONFIRM_CALLBACKS:
         only = CONFIRM_CALLBACKS[data]
@@ -915,10 +896,10 @@ def _handle_callback(callback: dict, sender: TelegramSender, users, channels) ->
             return
         created = False
         if user is None:
-            users.ensure(chat_id, first_name, username, now, language=detected)
+            users.ensure(chat_id, first_name, username, now, language=lang)
             created = True
         user = users.get(chat_id)
-        lang = users.lang(chat_id) if user is not None else detected
+        lang = config.DEFAULT_LANG
         sender.answer_callback_query(callback_id, config.join_confirmed_text(lang))
         if created:
             sender.send_message(
@@ -940,30 +921,9 @@ def _handle_callback(callback: dict, sender: TelegramSender, users, channels) ->
             sender.answer_callback_query(callback_id, config.join_required_hint_text(lang))
             _send_join_request(sender, chat_id, lang, missing)
             return
-        users.ensure(chat_id, first_name, username, now, language=detected)
+        users.ensure(chat_id, first_name, username, now, language=lang)
         user = users.get(chat_id)
-        lang = users.lang(chat_id) if user is not None else detected
-
-    if data == "lang_menu":
-        sender.answer_callback_query(callback_id)
-        sender.send_message(
-            chat_id, config.language_prompt_text(lang), reply_markup=_language_keyboard()
-        )
-        return
-
-    if data.startswith("set_lang:"):
-        code = data.split(":", 1)[1].strip().lower()
-        if not users.set_language(chat_id, code):
-            sender.answer_callback_query(callback_id)
-            return
-        lang = users.lang(chat_id)
-        sender.answer_callback_query(callback_id, config.language_saved_text(lang))
-        sender.send_message(
-            chat_id,
-            config.settings_text(lang, _subscribed(user)),
-            reply_markup=_settings_keyboard(lang, False),
-        )
-        return
+        lang = config.DEFAULT_LANG
 
     if data == "help":
         sender.answer_callback_query(callback_id, "✅")

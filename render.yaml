@@ -39,6 +39,12 @@ services:
         value: "0.05"
       - key: SCHEDULER_ENABLED
         value: "true"
+      - key: NEWS_TEST_MODE
+        value: "false"
+      - key: NEWS_TEST_LOOKBACK_DAYS
+        value: "15"
+      - key: NEWS_TEST_INTERVAL_SECONDS
+        value: "300"
       - key: TZ
         value: Asia/Tehran
       - key: ENABLE_PDF

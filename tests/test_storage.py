@@ -74,11 +74,12 @@ class StorageTestCase(unittest.TestCase):
         self.assertEqual(self.users.chat_ids(subscribed_only=False), [1, 2, 3])
         self.assertFalse(self.users.is_subscribed(2))
 
-    def test_language_helpers_fall_back_to_persian(self):
-        self.users.ensure(9, "U", "u")
-        self.assertEqual(self.users.lang(9), "fa")
+    def test_language_is_always_english(self):
+        self.users.ensure(9, "U", "u", language="fa")
+        self.assertEqual(self.users.lang(9), "en")
         self.assertTrue(self.users.set_lang(9, "en"))
         self.assertEqual(self.users.lang(9), "en")
+        self.assertFalse(self.users.set_lang(9, "fa"))
         self.assertFalse(self.users.set_lang(9, "de"))
         self.assertEqual(self.users.lang(9), "en")
 
@@ -88,11 +89,18 @@ class StorageTestCase(unittest.TestCase):
         self.assertEqual(user["language"], "en")
 
         other, _ = self.users.ensure(11, "U", "u", language="de")
-        self.assertEqual(other["language"], "fa")
+        self.assertEqual(other["language"], "en")
 
         self.assertTrue(self.users.set_language(11, "en"))
         self.assertEqual(self.users.lang(11), "en")
         self.assertFalse(self.users.set_language(11, "klingon"))
+
+    def test_existing_users_are_migrated_to_english(self):
+        self.users.ensure(12, "U", "u")
+        self.db.execute("UPDATE users SET language = 'fa' WHERE chat_id = '12'")
+        self.db.init()
+        self.assertEqual(self.users.get(12)["language"], "en")
+        self.assertEqual(self.users.lang(12), "en")
 
     def test_stats_counts_active_and_subscribed(self):
         self.users.ensure(1, "A", "a")

@@ -149,52 +149,62 @@ class ServerTests(unittest.TestCase):
         )
 
     # -- onboarding ---------------------------------------------------- #
-    def test_new_user_start_gets_the_persian_welcome(self):
+    def test_new_user_start_gets_the_english_welcome_and_is_subscribed(self):
         self.assertEqual(self._post_update(self._message("/start")).status_code, 200)
         self.assertEqual(len(self.sent), 1)
         text = self.sent[0]["text"]
-        self.assertIn("سلام! 👋 به ربات اخبار خوش آمدید.", text)
-        self.assertIn("شما با موفقیت ثبت‌نام شدید. ✅", text)
-        self.assertIn("اشتراک اخبار: فعال", text)
-        self.assertIn("🌐 زبان: فارسی", text)
+        self.assertIn("Welcome to the news bot.", text)
+        self.assertIn("registered successfully", text)
+        self.assertIn("News subscription: active", text)
+        self.assertIn("English", text)
         self.assertEqual(
             self.sent[0]["markup"]["keyboard"][0][0]["text"], "/start"
         )
         rows = self.server.db().query("SELECT chat_id, is_subscribed FROM users")
         self.assertEqual(rows, [{"chat_id": "900", "is_subscribed": 1}])
+        self.assertEqual(self.server.db().query("SELECT language FROM users")[0]["language"], "en")
 
     def test_returning_user_start_shows_settings_with_start_keyboard(self):
         self._post_update(self._message("/start", update_id=1))
         self._post_update(self._message("/start", update_id=2))
         text = self.sent[-1]["text"]
-        self.assertIn("تنظیمات شما", text)
-        self.assertIn("فعال ✅", text)
+        self.assertIn("Your settings", text)
+        self.assertIn("active ✅", text)
         keyboard = self.sent[-1]["markup"]
         self.assertTrue(keyboard["is_persistent"])
         self.assertEqual(keyboard["keyboard"][0][0]["text"], "/start")
-        self.assertEqual(keyboard["keyboard"][0][1]["text"], "/lang")
+        self.assertEqual(keyboard["keyboard"][0][1]["text"], "/help")
 
     def test_unsubscribe_and_subscribe_commands(self):
         self._post_update(self._message("/start", update_id=1))
         self._post_update(self._message("/unsubscribe", update_id=2))
-        self.assertIn("غیرفعال", self.sent[-1]["text"])
+        self.assertIn("off", self.sent[-1]["text"])
         self.assertEqual(
             self.server.db().query("SELECT is_subscribed FROM users")[0]["is_subscribed"], 0
         )
         self._post_update(self._message("/subscribe", update_id=3))
-        self.assertIn("فعال شد", self.sent[-1]["text"])
+        self.assertIn("active", self.sent[-1]["text"])
         self.assertEqual(
             self.server.db().query("SELECT is_subscribed FROM users")[0]["is_subscribed"], 1
         )
 
+    def test_start_reactivates_a_returning_user(self):
+        self._post_update(self._message("/start", update_id=1))
+        self.server.db().execute("UPDATE users SET is_subscribed = 0 WHERE chat_id = '900'")
+        self._post_update(self._message("/start", update_id=2))
+        self.assertEqual(
+            self.server.db().query("SELECT is_subscribed FROM users")[0]["is_subscribed"], 1
+        )
+        self.assertIn("active ✅", self.sent[-1]["text"])
+
     def test_subscribe_without_registration_auto_registers(self):
         self._post_update(self._message("/subscribe"))
-        self.assertIn("فعال شد", self.sent[-1]["text"])
+        self.assertIn("active", self.sent[-1]["text"])
         self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM users")[0]["n"], 1)
 
     def test_button_without_registration_auto_registers(self):
         self._post_update(self._callback("help", update_id=1))
-        self.assertIn("راهنمای ربات اخبار", self.sent[-1]["text"])
+        self.assertIn("Bot help", self.sent[-1]["text"])
         self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM users")[0]["n"], 1)
 
     def test_plain_text_nudges_registered_users_only(self):
@@ -207,9 +217,9 @@ class ServerTests(unittest.TestCase):
     def test_help_command_and_callback(self):
         self._post_update(self._message("/start", update_id=1))
         self._post_update(self._message("/help", update_id=2))
-        self.assertIn("راهنمای ربات اخبار", self.sent[-1]["text"])
+        self.assertIn("Bot help", self.sent[-1]["text"])
         self._post_update(self._callback("help", update_id=3))
-        self.assertIn("راهنمای ربات اخبار", self.sent[-1]["text"])
+        self.assertIn("Bot help", self.sent[-1]["text"])
 
     def test_toggle_callback_flips_subscription(self):
         self._post_update(self._message("/start", update_id=1))
@@ -222,33 +232,17 @@ class ServerTests(unittest.TestCase):
             self.server.db().query("SELECT is_subscribed FROM users")[0]["is_subscribed"], 1
         )
 
-    def test_start_detects_english_from_language_code(self):
+    def test_start_always_uses_english(self):
         self._post_update(self._message("/start", language_code="en-US"))
         self.assertIn("Welcome to the news bot", self.sent[-1]["text"])
-        self.assertIn("Language: English", self.sent[-1]["text"])
         row = self.server.db().query("SELECT language FROM users")[0]
         self.assertEqual(row["language"], "en")
 
-    def test_start_with_persian_language_code_stays_persian(self):
+    def test_non_english_telegram_locale_is_ignored(self):
         self._post_update(self._message("/start", language_code="fa-IR"))
-        self.assertIn("به ربات اخبار خوش آمدید", self.sent[-1]["text"])
+        self.assertIn("Welcome to the news bot", self.sent[-1]["text"])
         row = self.server.db().query("SELECT language FROM users")[0]
-        self.assertEqual(row["language"], "fa")
-
-    def test_lang_command_shows_both_languages_and_saves_the_choice(self):
-        self._post_update(self._message("/start", update_id=1))
-        self._post_update(self._message("/lang", update_id=2))
-        buttons = self.sent[-1]["markup"]["inline_keyboard"][0]
-        self.assertEqual([button["text"] for button in buttons], ["فارسی 🇮🇷", "English 🇬🇧"])
-        self.assertEqual(
-            [button["callback_data"] for button in buttons], ["set_lang:fa", "set_lang:en"]
-        )
-        self._post_update(self._callback("set_lang:en", update_id=3))
-        self.assertEqual(
-            self.server.db().query("SELECT language FROM users")[0]["language"], "en"
-        )
-        self.assertIn("Your settings", self.sent[-1]["text"])
-        self.assertIn("Language: English", self.sent[-1]["text"])
+        self.assertEqual(row["language"], "en")
 
     def test_channel_gating_join_message_and_confirm_callback(self):
         state = {"member": False}
@@ -282,7 +276,7 @@ class ServerTests(unittest.TestCase):
             keyboard = sent[0]["markup"]["inline_keyboard"]
             self.assertEqual(keyboard[0][0]["url"], "https://t.me/mynews")
             self.assertEqual(keyboard[-1][0]["callback_data"], "check_membership")
-            self.assertEqual(keyboard[-1][0]["text"], "✅ تایید عضویت")
+            self.assertEqual(keyboard[-1][0]["text"], "✅ I've Joined")
             self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM users")[0]["n"], 0)
 
             # Clicking confirm while still outside the channel repeats the prompt.
@@ -293,7 +287,7 @@ class ServerTests(unittest.TestCase):
             state["member"] = True
             self._post_update(self._callback("check_membership", update_id=3))
             self.assertEqual(len(sent), 3)
-            self.assertIn("به ربات اخبار خوش آمدید", sent[2]["text"])
+            self.assertIn("Welcome to the news bot", sent[2]["text"])
             self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM users")[0]["n"], 1)
 
     def test_aiceur_zero_is_the_required_channel(self):
@@ -399,7 +393,7 @@ class ServerTests(unittest.TestCase):
             )
 
             self._post_update(self._message("/stats", chat_id=42, update_id=3))
-            self.assertIn("آمار کاربران", self.sent[-1]["text"])
+            self.assertIn("Bot statistics", self.sent[-1]["text"])
 
             self._post_update(self._message("/removechannel examplech", chat_id=42, update_id=4))
             self.assertEqual(self.server.db().query("SELECT COUNT(*) AS n FROM channels")[0]["n"], 0)

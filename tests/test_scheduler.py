@@ -78,6 +78,27 @@ class DueTests(unittest.TestCase):
         self.assertFalse(first.get("skipped"))
         self.assertTrue(second.get("skipped"))
 
+    def test_test_mode_sends_one_item_per_five_minute_interval(self):
+        now = storage.utc_now()
+        with patch.object(config, "NEWS_TEST_MODE", True), patch.object(
+            config, "NEWS_TEST_INTERVAL_SECONDS", 300
+        ), patch.object(
+            scheduler,
+            "utc_now",
+            side_effect=[now, now + timedelta(minutes=4), now + timedelta(minutes=5)],
+        ), patch.object(scheduler, "main") as fake_main:
+            fake_main.run_news.return_value = {"ok": True, "approved": 1, "messages": 1}
+            first = scheduler.run_due(db=self.db, limit=0)
+            early = scheduler.run_due(db=self.db)
+            due = scheduler.run_due(db=self.db, limit=10)
+
+        self.assertFalse(first.get("skipped"))
+        self.assertEqual(fake_main.run_news.call_count, 2)
+        self.assertEqual(fake_main.run_news.call_args_list[0].kwargs["limit"], 1)
+        self.assertEqual(fake_main.run_news.call_args_list[1].kwargs["limit"], 1)
+        self.assertTrue(early.get("skipped"))
+        self.assertFalse(due.get("skipped"))
+
     def test_status_reports_the_next_slot(self):
         with patch.object(scheduler, "open_database", return_value=self.db):
             payload = scheduler.status()

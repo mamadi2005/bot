@@ -248,7 +248,12 @@ def prefilter(
             continue
 
         age = _age_hours(item, now)
-        if age > item.max_age_hours:
+        max_age_hours = item.max_age_hours
+        if config.NEWS_TEST_MODE:
+            max_age_hours = max(
+                max_age_hours, config.NEWS_TEST_LOOKBACK_DAYS * 24
+            )
+        if age > max_age_hours:
             counters["stale"] += 1
             continue
 

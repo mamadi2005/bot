@@ -174,6 +174,16 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _lookback_hours(default: int) -> int:
+    if config.NEWS_TEST_MODE:
+        return config.NEWS_TEST_LOOKBACK_DAYS * 24
+    return default
+
+
+def _test_limit(current: int, maximum: int) -> int:
+    return min(maximum, max(current, maximum if config.NEWS_TEST_MODE else current))
+
+
 def _parse_iso(value: Any) -> datetime | None:
     if not value:
         return None
@@ -370,7 +380,12 @@ def fetch_github() -> list[Item]:
     out: list[Item] = []
     seen: set[str] = set()
     skipped = 0
-    since = (_utcnow() - timedelta(days=config.GITHUB_WINDOW_DAYS)).strftime("%Y-%m-%d")
+    lookback_days = (
+        config.NEWS_TEST_LOOKBACK_DAYS
+        if config.NEWS_TEST_MODE
+        else config.GITHUB_WINDOW_DAYS
+    )
+    since = (_utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     for keyword in config.GITHUB_KEYWORDS:
         params = {
             "q": (
@@ -379,7 +394,7 @@ def fetch_github() -> list[Item]:
             ),
             "sort": "stars",
             "order": "desc",
-            "per_page": config.GITHUB_PER_KEYWORD,
+            "per_page": _test_limit(config.GITHUB_PER_KEYWORD, 100),
         }
         data = _get_json(
             f"{GITHUB_API}/search/repositories",
@@ -485,7 +500,10 @@ def fetch_hn() -> list[Item]:
     out: list[Item] = []
     seen: set[str] = set()
     since_ts = int(
-        (_utcnow() - timedelta(hours=config.SOCIAL_MAX_AGE_HOURS)).timestamp()
+        (
+            _utcnow()
+            - timedelta(hours=_lookback_hours(config.SOCIAL_MAX_AGE_HOURS))
+        ).timestamp()
     )
     for query in config.HN_QUERIES:
         params = {
@@ -494,7 +512,7 @@ def fetch_hn() -> list[Item]:
             "numericFilters": (
                 f"points>{config.HN_MIN_POINTS},created_at_i>{since_ts}"
             ),
-            "hitsPerPage": config.HN_PER_QUERY,
+            "hitsPerPage": _test_limit(config.HN_PER_QUERY, 100),
         }
         data = _get_json(HN_API, params=params)
         if not isinstance(data, dict):
@@ -519,7 +537,7 @@ def fetch_hn() -> list[Item]:
                     source_label="Hacker News",
                     summary=story_text[:600],
                     published_at=_from_ts(hit.get("created_at_i")),
-                    max_age_hours=config.SOCIAL_MAX_AGE_HOURS,
+                    max_age_hours=_lookback_hours(config.SOCIAL_MAX_AGE_HOURS),
                     engagement={
                         "points": int(hit.get("points") or 0),
                         "comments": int(hit.get("num_comments") or 0),
@@ -542,7 +560,11 @@ def fetch_bluesky() -> list[Item]:
     for query in config.BLUESKY_QUERIES:
         data = _get_json(
             BLUESKY_API,
-            params={"q": query, "sort": "top", "limit": config.BLUESKY_PER_QUERY},
+            params={
+                "q": query,
+                "sort": "top",
+                "limit": _test_limit(config.BLUESKY_PER_QUERY, 100),
+            },
         )
         if not isinstance(data, dict):
             continue
@@ -574,7 +596,7 @@ def fetch_bluesky() -> list[Item]:
                     source_label="Bluesky",
                     summary=text[:600],
                     published_at=_parse_iso(record.get("createdAt")),
-                    max_age_hours=config.SOCIAL_MAX_AGE_HOURS,
+                    max_age_hours=_lookback_hours(config.SOCIAL_MAX_AGE_HOURS),
                     engagement={
                         "likes": int(post.get("likeCount") or 0),
                         "reposts": int(post.get("repostCount") or 0),
@@ -598,7 +620,9 @@ def fetch_mastodon() -> list[Item]:
         for candidate in hosts:
             data = _get_json(
                 f"{candidate}/api/v1/timelines/tag/{tag}",
-                params={"limit": config.MASTODON_PER_TAG},
+                params={
+                    "limit": _test_limit(config.MASTODON_PER_TAG, 40)
+                },
             )
             if isinstance(data, list):
                 host = candidate
@@ -640,7 +664,7 @@ def fetch_mastodon() -> list[Item]:
                     source_label=label,
                     summary=body[:600],
                     published_at=_parse_iso(status.get("created_at")),
-                    max_age_hours=config.SOCIAL_MAX_AGE_HOURS,
+                    max_age_hours=_lookback_hours(config.SOCIAL_MAX_AGE_HOURS),
                     engagement={
                         "favourites": int(status.get("favourites_count") or 0),
                         "reblogs": int(status.get("reblogs_count") or 0),
@@ -668,7 +692,8 @@ def _fetch_feed(feed: config.Feed) -> list[Item]:
     parsed = feedparser.parse(response.content)
     if getattr(parsed, "bozo", 0):
         log.debug("rss bozo feed=%s err=%s", feed.name, getattr(parsed, "bozo_exception", ""))
-    for entry in parsed.entries[: config.RSS_PER_FEED]:
+    feed_limit = _test_limit(config.RSS_PER_FEED, 100)
+    for entry in parsed.entries[:feed_limit]:
         title = _clean(entry.get("title") or "")
         link = (entry.get("link") or "").strip()
         if not title or not link:
@@ -688,7 +713,7 @@ def _fetch_feed(feed: config.Feed) -> list[Item]:
                 source_label=feed.name,
                 summary=summary[:800],
                 published_at=published,
-                max_age_hours=config.RSS_MAX_AGE_HOURS,
+                max_age_hours=_lookback_hours(config.RSS_MAX_AGE_HOURS),
                 meta={"feed": feed.name, "weight": feed.weight, "ai_feed": feed.ai},
             )
         )
@@ -737,7 +762,7 @@ def fetch_arxiv() -> list[Item]:
                     _from_struct(entry.get("published_parsed"))
                     or _from_struct(entry.get("updated_parsed"))
                 ),
-                max_age_hours=config.ARXIV_MAX_AGE_HOURS,
+                max_age_hours=_lookback_hours(config.ARXIV_MAX_AGE_HOURS),
                 engagement={"abstract_chars": len(entry.get("summary") or "")},
                 meta={"authors": [a.get("name") for a in entry.get("authors", [])][:6]},
             )
@@ -752,7 +777,10 @@ def fetch_cisa_kev() -> list[Item]:
     data = _get_json(CISA_KEV_URL, timeout=40)
     if not isinstance(data, dict):
         return []
-    cutoff = (_utcnow() - timedelta(days=7)).date()
+    lookback_days = (
+        config.NEWS_TEST_LOOKBACK_DAYS if config.NEWS_TEST_MODE else 7
+    )
+    cutoff = (_utcnow() - timedelta(days=lookback_days)).date()
     out: list[Item] = []
     for vuln in data.get("vulnerabilities", []):
         added = vuln.get("dateAdded")
@@ -790,7 +818,7 @@ def fetch_cisa_kev() -> list[Item]:
                 published_at=datetime.combine(
                     added_date, dt_time.min, tzinfo=timezone.utc
                 ),
-                max_age_hours=config.KEV_MAX_AGE_HOURS,
+                max_age_hours=_lookback_hours(config.KEV_MAX_AGE_HOURS),
                 engagement={"kev": 1},
                 meta={
                     "cve": cve,
@@ -825,7 +853,7 @@ def fetch_reddit() -> list[Item]:
 def _reddit_json(subreddit: str, seen: set[str]) -> list[Item]:
     data = _get_json(
         f"{REDDIT_BASE}/r/{subreddit}/new.json",
-        params={"limit": config.REDDIT_PER_SUB, "raw_json": 1},
+        params={"limit": _test_limit(config.REDDIT_PER_SUB, 100), "raw_json": 1},
         timeout=8,
     )
     if not isinstance(data, dict):
@@ -860,7 +888,7 @@ def _reddit_json(subreddit: str, seen: set[str]) -> list[Item]:
                 source_label=f"r/{subreddit}",
                 summary=body[:800] or title,
                 published_at=_from_ts(post.get("created_utc")),
-                max_age_hours=config.REDDIT_MAX_AGE_HOURS,
+                max_age_hours=_lookback_hours(config.REDDIT_MAX_AGE_HOURS),
                 engagement={"ups": int(post.get("ups") or 0)},
                 meta={"subreddit": subreddit, "is_self": is_self},
             )
@@ -878,7 +906,8 @@ def _reddit_rss(subreddit: str, seen: set[str]) -> list[Item]:
         return []
     parsed = feedparser.parse(response.content)
     out: list[Item] = []
-    for entry in parsed.entries[: config.REDDIT_PER_SUB]:
+    entry_limit = _test_limit(config.REDDIT_PER_SUB, 100)
+    for entry in parsed.entries[:entry_limit]:
         link = (entry.get("link") or "").strip()
         title = _clean(entry.get("title") or "")
         if not link or not title or link in seen:
@@ -895,7 +924,7 @@ def _reddit_rss(subreddit: str, seen: set[str]) -> list[Item]:
                     _from_struct(entry.get("published_parsed"))
                     or _from_struct(entry.get("updated_parsed"))
                 ),
-                max_age_hours=config.REDDIT_MAX_AGE_HOURS,
+                max_age_hours=_lookback_hours(config.REDDIT_MAX_AGE_HOURS),
                 meta={"subreddit": subreddit},
             )
         )

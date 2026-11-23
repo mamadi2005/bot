@@ -1,4 +1,4 @@
-"""Optional daily Persian PDF digest (WeasyPrint + Vazirmatn)."""
+"""Optional daily English PDF digest."""
 
 from __future__ import annotations
 
@@ -12,27 +12,25 @@ import config
 log = logging.getLogger(__name__)
 
 TEMPLATE = """<!doctype html>
-<html lang="fa" dir="rtl">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <title>{title}</title>
 <style>
-{font_faces}
 @page {{
   size: A4;
   margin: 18mm 15mm 20mm 15mm;
   @bottom-center {{
     content: counter(page) " / " counter(pages);
-    font-family: "Vazirmatn", sans-serif;
+    font-family: "DejaVu Sans", sans-serif;
     font-size: 9pt;
     color: #777;
   }}
 }}
 * {{ box-sizing: border-box; }}
 body {{
-  font-family: "Vazirmatn", "DejaVu Sans", sans-serif;
-  direction: rtl;
-  text-align: right;
+  font-family: "DejaVu Sans", Arial, sans-serif;
+  text-align: left;
   color: #1b1b1b;
   font-size: 11pt;
   line-height: 1.85;
@@ -69,7 +67,7 @@ header .sub {{ font-size: 10pt; color: #555; }}
 .body blockquote {{
   margin: 8px 0;
   padding: 6px 10px;
-  border-right: 3px solid #0b5cad;
+  border-left: 3px solid #0b5cad;
   background: #f7f9fc;
 }}
 a {{ color: #0b5cad; text-decoration: none; word-break: break-all; }}
@@ -86,27 +84,6 @@ footer {{ margin-top: 24px; font-size: 9pt; color: #666; }}
 </body>
 </html>
 """
-
-
-def _font_faces(font_dir: Path) -> str:
-    regular = font_dir / "Vazirmatn-Regular.ttf"
-    bold = font_dir / "Vazirmatn-Bold.ttf"
-    faces = [
-        "@font-face {\n"
-        '  font-family: "Vazirmatn";\n'
-        f'  src: url("{regular.as_uri()}");\n'
-        "  font-weight: 400;\n"
-        "}"
-    ]
-    if bold.exists():
-        faces.append(
-            "@font-face {\n"
-            '  font-family: "Vazirmatn";\n'
-            f'  src: url("{bold.as_uri()}");\n'
-            "  font-weight: 700;\n"
-            "}"
-        )
-    return "\n".join(faces)
 
 
 def _render_item(item: dict) -> str:
@@ -137,24 +114,15 @@ def build_daily_pdf(
         log.warning("weasyprint unavailable: %s", exc.__class__.__name__)
         return None
 
-    font_dir = config.ROOT_DIR / "assets" / "fonts"
-    if not (font_dir / "Vazirmatn-Regular.ttf").exists():
-        log.warning(
-            "Vazirmatn fonts missing in %s; PDF skipped (see README)", font_dir
-        )
-        return None
-
     document = TEMPLATE.format(
-        title="رادار امنیت",
+        title="Security Radar",
         subtitle=(
-            "خلاصه روزانه امنیت سایبری و هوش مصنوعی — "
-            f"{html.escape(str(day or date.today()))} — {len(items)} تحلیل"
+            "Daily cybersecurity and AI-security digest — "
+            f"{html.escape(str(day or date.today()))} — {len(items)} summaries"
         ),
         footer=(
-            "این گزارش با AI تولید شده است. پیش از استناد، منبع اصلی هر مورد را "
-            "بررسی کنید."
+            "AI-generated report. Verify each item's original source before citing it."
         ),
-        font_faces=_font_faces(font_dir),
         items="\n".join(_render_item(item) for item in items),
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -171,7 +139,7 @@ def build_daily_pdf(
 
 def pdf_caption(day: str, count: int) -> str:
     return (
-        "📄 <b>گزارش روزانه امنیت سایبری و هوش مصنوعی</b>\n"
-        f"🗓 <code>{html.escape(day)}</code> | {count} تحلیل\n"
-        "<i>این گزارش با AI تولید شده — منابع اصلی را بررسی کنید.</i>"
+        "📄 <b>Daily cybersecurity and AI-security digest</b>\n"
+        f"🗓 <code>{html.escape(day)}</code> | {count} summaries\n"
+        "<i>AI-generated — verify the original sources.</i>"
     )

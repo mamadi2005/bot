@@ -1,6 +1,6 @@
 """Hybrid architecture: webhook bot on Render + scheduled news runs.
 
-One news run is: fetch -> filter -> triage -> summarize (Persian) -> deliver ->
+One news run is: fetch -> filter -> triage -> summarize (English) -> deliver ->
 expire. The same function powers the CLI (``python main.py``) and the
 ``/trigger_news`` endpoint that GitHub Actions calls on a schedule.
 """
@@ -14,14 +14,13 @@ import re
 import sys
 import threading
 import time
-import unicodedata
 from datetime import datetime, timedelta
 
 import config
 from analyzer import AIBudget, Analyzer, AnalyzerError, fallback_summary
 from fetcher import Item, enrich_full_text, fetch_all
 from filter import finalize_candidates, prefilter
-from storage import ChannelStore, NewsStore, UserStore, iso, open_database, parse_iso, stores, utc_now
+from storage import ChannelStore, NewsStore, UserStore, iso, open_database, stores, utc_now
 from telegram_sender import TelegramSender, handle_updates, sanitize_html
 
 log = logging.getLogger("main")
@@ -79,41 +78,37 @@ def setup_logging(debug: bool = False) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Persian enforcement
+# English-language enforcement
 # --------------------------------------------------------------------------- #
-_PERSIAN = re.compile(r"[\u0600-\u06FF]")
 _LATIN = re.compile(r"[A-Za-z]")
+_ENGLISH_COMMON_WORDS = {
+    "a", "about", "after", "also", "and", "are", "as", "at", "be", "been",
+    "by", "can", "for", "from", "has", "have", "in", "into", "is", "it",
+    "its", "may", "not", "of", "on", "or", "that", "the", "their", "this",
+    "to", "was", "were", "will", "with",
+}
 
 
-def _script_counts(text: str) -> tuple[int, int]:
+def _english_counts(text: str) -> tuple[int, int]:
     plain = re.sub(r"<[^>]*>", " ", text or "")
     plain = re.sub(r"https?://\S+", " ", plain)
-    return len(_PERSIAN.findall(plain)), len(_LATIN.findall(plain))
-
-
-def _script_shares(text: str) -> tuple[float, float]:
-    persian, latin = _script_counts(text)
-    total = persian + latin
-    return (0.0, 0.0) if total == 0 else (persian / total, latin / total)
-
-
-def persian_share(text: str) -> float:
-    return _script_shares(text)[0]
-
-
-def looks_persian(text: str) -> bool:
-    persian, _ = _script_counts(text)
-    return persian >= 30 and persian_share(text) >= 0.45
+    letters = len(_LATIN.findall(plain))
+    total = letters + len(re.findall(r"[^\W\d_]", plain, re.UNICODE)) - letters
+    return letters, total
 
 
 def looks_english(text: str) -> bool:
-    _, latin = _script_counts(text)
-    return latin >= 30 and _script_shares(text)[1] >= 0.45
-
-
-def normalize_persian(text: str) -> str:
-    """Unify Arabic/Persian variants so output reads consistently Persian."""
-    return unicodedata.normalize("NFC", text or "").replace("\u064A", "\u06CC").replace("\u0643", "\u06A9")
+    plain = re.sub(r"<[^>]*>", " ", text or "")
+    plain = re.sub(r"https?://\S+", " ", plain)
+    latin, letters = _english_counts(plain)
+    words = re.findall(r"[A-Za-z]+", plain.lower())
+    common_words = sum(word in _ENGLISH_COMMON_WORDS for word in words)
+    return (
+        latin >= 30
+        and letters > 0
+        and latin / letters >= 0.7
+        and common_words >= 2
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -153,9 +148,9 @@ def _safe_admin_alert(sender: TelegramSender | None, exc: Exception, dry_run: bo
     detail = redact(f"{exc.__class__.__name__}: {exc}")[:600]
     _notify_admin(
         sender,
-        "⚠️ <b>خطای اجرای ربات</b>\n"
+        "⚠️ <b>News bot error</b>\n"
         f"<code>{html.escape(detail)}</code>\n"
-        "<i>لاگ اجرای ربات را بررسی کنید.</i>",
+        "<i>Check the service logs for details.</i>",
     )
 
 
@@ -177,13 +172,13 @@ def process_updates(
 # --------------------------------------------------------------------------- #
 # Analysis
 # --------------------------------------------------------------------------- #
-def _store_summaries(item: Item, texts: dict[str, str]) -> None:
-    item.summaries = dict(texts)
-    item.summary_html = texts.get(config.DEFAULT_LANG) or next(iter(texts.values()), "")
+def _store_summary(item: Item, text: str) -> None:
+    item.summaries = {"en": text}
+    item.summary_html = text
 
 
-def _fallback(item: Item, lang: str) -> str:
-    return sanitize_html(fallback_summary(item, lang))
+def _fallback(item: Item) -> str:
+    return sanitize_html(fallback_summary(item))
 
 
 def _analyze(
@@ -191,22 +186,15 @@ def _analyze(
     no_ai: bool,
     budget: AIBudget,
     stats: dict,
-    langs: list[str],
-    dry_run: bool = False,
 ) -> tuple[list[Item], bool]:
-    """Triage + summarize in every language the recipients use."""
-    langs = [
-        lang for lang in (langs or [config.DEFAULT_LANG]) if lang in config.SUPPORTED_LANGS
-    ]
-    if not langs:
-        langs = [config.DEFAULT_LANG]
+    """Triage and summarize each approved item once in English."""
     if not candidates:
         return [], False
 
     if no_ai:
         selected = candidates[:3]
         for item in selected:
-            _store_summaries(item, {lang: _fallback(item, lang) for lang in langs})
+            _store_summary(item, _fallback(item))
         log.info("no-ai mode selected=%d", len(selected))
         return selected, False
 
@@ -216,58 +204,47 @@ def _analyze(
         log.warning("analyzer unavailable: %s", exc)
         selected = candidates[:3]
         for item in selected:
-            _store_summaries(item, {lang: _fallback(item, lang) for lang in langs})
+            _store_summary(item, _fallback(item))
         return selected, False
 
-    log.info("analyzer keys=%d langs=%s", analyzer.key_count, ",".join(langs))
+    log.info("analyzer keys=%d language=en", analyzer.key_count)
     selected = analyzer.triage(candidates)
     if selected is None:
         fallback_items = candidates[:3]
         for item in fallback_items:
-            _store_summaries(item, {lang: _fallback(item, lang) for lang in langs})
+            _store_summary(item, _fallback(item))
         log.warning("triage unavailable; delivering top=%d with plain summaries", len(fallback_items))
         return fallback_items, budget.daily_remaining() <= 0
+    if not selected:
+        selected = candidates[:1]
+        log.warning(
+            "triage approved no candidates; using best prefiltered item count=%d",
+            len(selected),
+        )
 
     approved: list[Item] = []
     quota_exhausted = False
     rejected = 0
     for item in selected[: config.MAX_ITEMS_PER_RUN]:
-        texts: dict[str, str] = {}
-        skipped = False
-        for index, lang in enumerate(langs):
-            result = analyzer.summarize(item, lang)
-            if result.status == "quota":
-                quota_exhausted = True
-                texts[lang] = _fallback(item, lang)
-                continue
-            if result.status == "skip":
-                if index == 0 and not texts:
-                    skipped = True
-                    break
-                continue
-            text = sanitize_html(result.text or "")
-            valid_language = looks_persian(text) if lang == "fa" else looks_english(text)
-            if not valid_language:
-                rejected += 1
-                share = persian_share(text) if lang == "fa" else _script_shares(text)[1]
-                log.warning(
-                    "wrong-language summary rejected lang=%s source=%s share=%.2f",
-                    lang,
-                    item.source_label,
-                    share,
-                )
-                text = _fallback(item, lang)
-            elif lang == "fa":
-                text = normalize_persian(text)
-            texts[lang] = text or _fallback(item, lang)
-        if skipped or not texts:
+        result = analyzer.summarize(item)
+        if result.status == "skip":
             continue
-        _store_summaries(item, texts)
+        if result.status == "quota":
+            quota_exhausted = True
+        text = sanitize_html(result.text or "")
+        if not looks_english(text):
+            rejected += 1
+            log.warning(
+                "non-English summary rejected source=%s",
+                item.source_label,
+            )
+            text = _fallback(item)
+        _store_summary(item, text or _fallback(item))
         approved.append(item)
 
     stats["ai_calls"] = budget.used_this_run
     log.info(
-        "analysis approved=%d ai_calls=%d rejected_wrong_language=%d daily_remaining=%d",
+        "analysis approved=%d ai_calls=%d rejected_non_english=%d daily_remaining=%d",
         len(approved),
         budget.used_this_run,
         rejected,
@@ -279,15 +256,6 @@ def _analyze(
 # --------------------------------------------------------------------------- #
 # Delivery
 # --------------------------------------------------------------------------- #
-def _summary_langs() -> list[str]:
-    """All supported languages, so mid-run preference changes still match."""
-    langs = list(config.SUPPORTED_LANGS)
-    if config.DEFAULT_LANG in langs:
-        langs.remove(config.DEFAULT_LANG)
-        langs.insert(0, config.DEFAULT_LANG)
-    return langs or [config.DEFAULT_LANG]
-
-
 def _recipients(users: UserStore, days: int = 0) -> list[int]:
     """Configured chat IDs (never gated) followed by every subscribed user."""
     ordered: list[str] = [str(value) for value in config.recipient_chat_ids()]
@@ -306,12 +274,16 @@ def _recipients(users: UserStore, days: int = 0) -> list[int]:
         if value in unique:
             continue
         try:
-            int(value)
+            chat_id = int(value)
         except (TypeError, ValueError):
+            continue
+        if users.get(chat_id) is not None and not users.is_subscribed(chat_id):
             continue
         unique.append(value)
     if not unique and config.ADMIN_CHAT_ID:
-        unique = [str(config.ADMIN_CHAT_ID)]
+        admin_id = str(config.ADMIN_CHAT_ID)
+        if users.get(admin_id) is None or users.is_subscribed(admin_id):
+            unique = [admin_id]
     return [int(value) for value in unique]
 
 
@@ -348,19 +320,18 @@ def deliver_news(
     blocked: set[int] = set()
 
     for item in approved:
-        if not item.summaries and not item.summary_html:
-            continue
         delivered = 0
         for chat_id in recipients:
             if chat_id in blocked:
                 continue
+            if users.get(chat_id) is not None and not users.is_subscribed(chat_id):
+                continue
             if not gated.get(chat_id, True):
                 continue
-            lang = users.lang(chat_id)
-            text = item.summaries.get(lang) or _fallback(item, lang)
+            text = item.summaries.get("en") or _fallback(item)
             if not text:
                 continue
-            notice = config.news_expiry_warning(lang)
+            notice = config.news_expiry_warning()
             try:
                 sent = sender.send_message(
                     chat_id,
@@ -479,11 +450,7 @@ def run_news(
             used_today=used_today,
         )
 
-        recipients = _recipients(users)
-        langs = _summary_langs()
-        approved, quota_exhausted = _analyze(
-            candidates, no_ai, budget, stats, langs, dry_run=dry_run
-        )
+        approved, quota_exhausted = _analyze(candidates, no_ai, budget, stats)
         result["approved"] = len(approved)
 
         if dry_run:
@@ -491,21 +458,13 @@ def run_news(
         else:
             deliver_news(approved, store, sender, users, channels, now, stats, quota_exhausted)
             if config.ADMIN_CHAT_ID and stats["recipients"]:
-                admin_lang = users.lang(config.ADMIN_CHAT_ID)
                 if approved:
                     summary = (
                         f"✅ {len(approved)} new item(s) sent to "
                         f"{stats['recipients']} user(s)."
-                        if admin_lang == "en"
-                        else f"✅ خبر جدید ارسال شد: {len(approved)} مورد به "
-                        f"{stats['recipients']} کاربر."
                     )
                 else:
-                    summary = (
-                        "⚠️ The run finished but nothing was sent."
-                        if admin_lang == "en"
-                        else "⚠️ اجرای خبر تمام شد اما خبری ارسال نشد."
-                    )
+                    summary = "⚠️ The run finished but nothing was sent."
                 _notify_admin(sender, summary)
 
         store.set_state("ai_calls_date", today)

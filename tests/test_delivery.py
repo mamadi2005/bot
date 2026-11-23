@@ -14,6 +14,7 @@ import config
 import main
 import storage
 from fetcher import Item
+from filter import prefilter
 from telegram_sender import TelegramSender
 
 
@@ -61,7 +62,7 @@ class FakeTelegram(TelegramSender):
 
 def make_item(**overrides) -> Item:
     data = dict(
-        title="تیتر خبر امنیتی",
+        title="Security news headline",
         url="https://example.test/news",
         source_type="rss",
         source_label="source",
@@ -88,13 +89,10 @@ class HybridDeliveryTests(unittest.TestCase):
         except Exception:
             pass
 
-    def _item_with_fa_summary(self, text: str | None = None) -> Item:
+    def _item_with_english_summary(self, text: str | None = None) -> Item:
         item = make_item()
-        item.summaries = {
-            "fa": text
-            or "<b>این یک خلاصه فارسی درباره آسیب‌پذیری XSS در پنل مدیریت است که بسیار مهم است.</b>"
-        }
-        item.summary_html = item.summaries["fa"]
+        item.summaries = {"en": text or "<b>This is an English security summary about an XSS issue.</b>"}
+        item.summary_html = item.summaries["en"]
         return item
 
     # -- delivery ------------------------------------------------------ #
@@ -104,7 +102,7 @@ class HybridDeliveryTests(unittest.TestCase):
         self.users.set_subscribed(2, False)
         with patch.object(config, "BROADCAST_DELAY", 0):
             main.deliver_news(
-                [self._item_with_fa_summary()],
+                [self._item_with_english_summary()],
                 self.news,
                 self.sender,
                 self.users,
@@ -115,11 +113,17 @@ class HybridDeliveryTests(unittest.TestCase):
         targets = sorted(payload["chat_id"] for payload in self.sender.sends())
         self.assertEqual(targets, [1, 3])
 
+    def test_unsubscribed_configured_user_is_not_a_broadcast_recipient(self):
+        self.users.ensure(1, "U", "u")
+        self.users.set_subscribed(1, False)
+        with patch.object(config, "recipient_chat_ids", return_value=[1]):
+            self.assertEqual(main._recipients(self.users), [])
+
     def test_each_message_carries_the_24h_notice_and_html_mode(self):
         self.users.ensure(1, "U", "u")
         with patch.object(config, "BROADCAST_DELAY", 0):
             main.deliver_news(
-                [self._item_with_fa_summary()],
+                [self._item_with_english_summary()],
                 self.news,
                 self.sender,
                 self.users,
@@ -129,14 +133,14 @@ class HybridDeliveryTests(unittest.TestCase):
             )
         payload = self.sender.sends()[0]
         self.assertEqual(payload["parse_mode"], "HTML")
-        self.assertIn("۲۴ ساعت", payload["text"])
+        self.assertIn("24 hours", payload["text"])
 
     def test_delivery_records_expiry_rows(self):
         self.users.ensure(1, "U", "u")
         self.users.ensure(2, "U", "u")
         with patch.object(config, "BROADCAST_DELAY", 0):
             main.deliver_news(
-                [self._item_with_fa_summary()],
+                [self._item_with_english_summary()],
                 self.news,
                 self.sender,
                 self.users,
@@ -152,7 +156,7 @@ class HybridDeliveryTests(unittest.TestCase):
         self.users.ensure(1, "U", "u")
         with patch.object(config, "BROADCAST_DELAY", 0):
             main.deliver_news(
-                [self._item_with_fa_summary()],
+                [self._item_with_english_summary()],
                 self.news,
                 self.sender,
                 self.users,
@@ -171,7 +175,7 @@ class HybridDeliveryTests(unittest.TestCase):
         ]
         with patch.object(config, "BROADCAST_DELAY", 0):
             main.deliver_news(
-                [self._item_with_fa_summary()],
+                [self._item_with_english_summary()],
                 self.news,
                 self.sender,
                 self.users,
@@ -194,7 +198,7 @@ class HybridDeliveryTests(unittest.TestCase):
         gate = GateSender()
         with patch.object(config, "BROADCAST_DELAY", 0):
             main.deliver_news(
-                [self._item_with_fa_summary()],
+                [self._item_with_english_summary()],
                 self.news,
                 gate,
                 self.users,
@@ -204,15 +208,12 @@ class HybridDeliveryTests(unittest.TestCase):
             )
         self.assertEqual(gate.sends(), [])
 
-    def test_each_user_gets_the_summary_in_their_own_language(self):
+    def test_every_subscribed_user_gets_the_english_summary(self):
         self.users.ensure(1, "U", "u", language="fa")
         self.users.ensure(2, "U", "u", language="en")
         item = make_item()
-        item.summaries = {
-            "fa": "<b>خلاصه فارسی درباره آسیب‌پذیری XSS در پنل مدیریت است.</b>",
-            "en": "<b>English summary about an XSS vulnerability in the admin panel.</b>",
-        }
-        item.summary_html = item.summaries["fa"]
+        item.summaries = {"en": "<b>English summary about an XSS vulnerability in the admin panel.</b>"}
+        item.summary_html = item.summaries["en"]
         with patch.object(config, "BROADCAST_DELAY", 0):
             main.deliver_news(
                 [item],
@@ -224,40 +225,12 @@ class HybridDeliveryTests(unittest.TestCase):
                 {"messages": 0, "recipients": 0},
             )
         by_chat = {payload["chat_id"]: payload["text"] for payload in self.sender.sends()}
-        self.assertIn("خلاصه فارسی", by_chat[1])
-        self.assertIn("۲۴ ساعت", by_chat[1])
+        self.assertIn("English summary", by_chat[1])
+        self.assertIn("24 hours", by_chat[1])
         self.assertIn("English summary", by_chat[2])
         self.assertIn("24 hours", by_chat[2])
 
-    def test_all_supported_summary_languages_put_the_default_first(self):
-        self.assertEqual(main._summary_langs(), ["fa", "en"])
-
-    def test_language_change_during_analysis_uses_the_new_language_summary(self):
-        self.users.ensure(1, "U", "u", language="fa")
-        langs = main._summary_langs()
-        item = make_item()
-        item.summaries = {
-            "fa": "<b>خلاصه فارسی خبر امنیتی است.</b>",
-            "en": "<b>English security news summary.</b>",
-        }
-        item.summary_html = item.summaries["fa"]
-        self.users.set_language(1, "en")
-
-        with patch.object(config, "BROADCAST_DELAY", 0):
-            main.deliver_news(
-                [item],
-                self.news,
-                self.sender,
-                self.users,
-                self.channels,
-                self.now,
-                {"messages": 0, "recipients": 0},
-            )
-
-        self.assertEqual(langs, ["fa", "en"])
-        self.assertIn("English security news summary", self.sender.sends()[0]["text"])
-
-    def test_analysis_rejects_summaries_in_the_wrong_language(self):
+    def test_analysis_generates_only_one_english_summary(self):
         item = make_item(content="Technical details about the vulnerability. " * 4)
 
         class StubAnalyzer:
@@ -266,10 +239,10 @@ class HybridDeliveryTests(unittest.TestCase):
             def triage(self, candidates):
                 return candidates
 
-            def summarize(self, item, lang):
+            def summarize(self, item):
                 return SimpleNamespace(
                     status="ok",
-                    text="این یک خلاصه فارسی درباره آسیب‌پذیری و روش بررسی آن است.",
+                    text="Résumé du rapport présente une vulnérabilité critique dans le système de connexion.",
                 )
 
         with patch.object(main, "Analyzer", return_value=StubAnalyzer()):
@@ -278,19 +251,47 @@ class HybridDeliveryTests(unittest.TestCase):
                 no_ai=False,
                 budget=main.AIBudget(per_run=4, daily=4, used_today=0),
                 stats={},
-                langs=["fa", "en"],
             )
 
         self.assertEqual(approved, [item])
         self.assertFalse(quota_exhausted)
-        self.assertIn("خلاصه فارسی", item.summaries["fa"])
-        self.assertNotIn("خلاصه فارسی", item.summaries["en"])
+        self.assertEqual(set(item.summaries), {"en"})
         self.assertIn("Automatic summary", item.summaries["en"])
+
+    def test_empty_ai_triage_still_uses_best_prefiltered_candidate(self):
+        item = make_item(content="Technical details about the vulnerability. " * 4)
+
+        class StubAnalyzer:
+            key_count = 1
+
+            def triage(self, candidates):
+                return []
+
+            def summarize(self, item):
+                return SimpleNamespace(
+                    status="ok",
+                    text=(
+                        "<b>Security issue reported</b>\n"
+                        "The report explains how the vulnerable endpoint exposed user data. "
+                        "The issue was fixed by validating authorization on every request."
+                    ),
+                )
+
+        with patch.object(main, "Analyzer", return_value=StubAnalyzer()):
+            approved, _ = main._analyze(
+                [item],
+                no_ai=False,
+                budget=main.AIBudget(per_run=4, daily=4, used_today=0),
+                stats={},
+            )
+
+        self.assertEqual(approved, [item])
+        self.assertEqual(set(item.summaries), {"en"})
 
     def test_no_recipients_logs_and_sends_nothing(self):
         with patch.object(config, "BROADCAST_DELAY", 0):
             main.deliver_news(
-                [self._item_with_fa_summary()],
+                [self._item_with_english_summary()],
                 self.news,
                 self.sender,
                 self.users,
@@ -344,7 +345,7 @@ class HybridDeliveryTests(unittest.TestCase):
         self.channels.channels = []
         message = {
             "chat": {"id": 1, "type": "private"},
-            "from": {"id": 1, "first_name": "U", "language_code": "fa"},
+            "from": {"id": 1, "first_name": "U", "language_code": "en"},
             "text": "/start",
         }
         _handle_message(message, PlainSender(), self.users, self.channels)
@@ -358,37 +359,41 @@ class HybridDeliveryTests(unittest.TestCase):
         stats = main.cleanup_expired(self.news, self.sender, limit=3)
         self.assertEqual(stats["deleted"], 3)
 
-    # -- persian enforcement ------------------------------------------- #
-    def test_persian_detection_rejects_english_summaries(self):
+    # -- English enforcement ------------------------------------------- #
+    def test_english_detection_rejects_non_english_or_markup_only_text(self):
         english = "This is a purely English summary about an XSS vulnerability in the admin panel."
-        persian = "این یک خلاصهٔ فارسی دربارهٔ آسیب‌پذیری XSS در پنل مدیریت است و بسیار مهم است."
-        self.assertFalse(main.looks_persian(english))
-        self.assertTrue(main.looks_persian(persian))
-        self.assertFalse(main.looks_persian("<code>XSS</code> RCE SQLi"))
         self.assertTrue(main.looks_english(english))
-        self.assertFalse(main.looks_english(persian))
+        self.assertFalse(main.looks_english("Résumé du rapport présente une vulnérabilité critique."))
         self.assertFalse(main.looks_english("<code>XSS</code> RCE SQLi"))
 
-    def test_non_persian_summary_falls_back_when_delivered(self):
-        english = "<b>This is a purely English summary about an XSS vulnerability in the panel.</b>"
+    def test_missing_summary_uses_an_english_fallback(self):
         item = make_item()
-        item.summaries = {"fa": english}
-        item.summary_html = english
         self.users.ensure(1, "U", "u")
         with patch.object(config, "BROADCAST_DELAY", 0):
             main.deliver_news(
                 [item], self.news, self.sender, self.users, self.channels, self.now,
                 {"messages": 0, "recipients": 0},
             )
-        self.assertTrue(self.sender.sends())
+        self.assertIn("Automatic summary", self.sender.sends()[0]["text"])
 
-    def test_normalize_persian_folds_arabic_variants(self):
-        self.assertEqual(main.normalize_persian("يك"), "یک")
-        self.assertEqual(main.normalize_persian("كتاب"), "کتاب")
+    def test_test_mode_includes_news_published_within_15_days(self):
+        now = storage.utc_now()
+        item = make_item(
+            title="Security vulnerability in the dashboard",
+            summary=(
+                "A detailed security report describes a serious vulnerability "
+                "affecting dashboard endpoints and user data."
+            ),
+            published_at=now - timedelta(days=10),
+            max_age_hours=24,
+        )
+        with patch.object(config, "NEWS_TEST_MODE", True), patch.object(
+            config, "NEWS_TEST_LOOKBACK_DAYS", 15
+        ):
+            result = prefilter([item], set(), now)
 
-    def test_persian_share_ignores_urls_and_tags(self):
-        text = '<b>خبر بسیار مهمی است که باید خوانده شود</b> <a href="https://x.test/en-only-page">لینک</a>'
-        self.assertGreaterEqual(main.persian_share(text), 0.5)
+        self.assertEqual(result.counters["stale"], 0)
+        self.assertEqual(result.items, [item])
 
 
 if __name__ == "__main__":

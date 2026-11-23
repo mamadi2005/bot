@@ -101,7 +101,9 @@ PORT = env_int("PORT", 8080)
 NEWS_TTL_HOURS = max(1, env_int("NEWS_TTL_HOURS", 24))
 # In-process scheduler inside the Render web process (disable in tests).
 SCHEDULER_ENABLED = env_bool("SCHEDULER_ENABLED", True)
-
+NEWS_TEST_MODE = env_bool("NEWS_TEST_MODE", False)
+NEWS_TEST_LOOKBACK_DAYS = max(1, env_int("NEWS_TEST_LOOKBACK_DAYS", 15))
+NEWS_TEST_INTERVAL_SECONDS = max(60, env_int("NEWS_TEST_INTERVAL_SECONDS", 300))
 
 
 def _gemini_keys() -> list[str]:
@@ -201,8 +203,13 @@ MIN_ARTICLE_CHARS = env_int("MIN_ARTICLE_CHARS", 500)
 MIN_REPO_CHARS = env_int("MIN_REPO_CHARS", 250)
 MIN_ARXIV_CHARS = env_int("MIN_ARXIV_CHARS", 300)
 
-# Dedup only needs to outlive the widest source window (7 days).
-SENT_LOG_RETENTION_DAYS = env_int("SENT_LOG_RETENTION_DAYS", 14)
+# Keep dedup state at least one day longer than the historical test window.
+_default_sent_retention = (
+    max(14, NEWS_TEST_LOOKBACK_DAYS + 1) if NEWS_TEST_MODE else 14
+)
+SENT_LOG_RETENTION_DAYS = env_int(
+    "SENT_LOG_RETENTION_DAYS", _default_sent_retention
+)
 
 SOCIAL_MAX_AGE_HOURS = env_int("SOCIAL_MAX_AGE_HOURS", 36)
 RSS_MAX_AGE_HOURS = env_int("RSS_MAX_AGE_HOURS", 72)
@@ -300,15 +307,10 @@ def local_fetch_interval_seconds() -> int:
     return value
 
 
-def news_expiry_warning(lang: str) -> str:
-    if lang == "en":
-        return (
-            "This news message will be deleted after about 24 hours. "
-            "Save it to Saved Messages to keep it."
-        )
+def news_expiry_warning(lang: str = "en") -> str:
     return (
-        "این پیام خبری حدود ۲۴ ساعت بعد حذف می‌شود. "
-        "برای نگهداری، آن را در Saved Messages ذخیره کنید."
+        "This news message will be deleted after about 24 hours. "
+        "Save it to Saved Messages to keep it."
     )
 
 
@@ -552,11 +554,10 @@ LISTICLE_PATTERNS = (
 
 
 # --------------------------------------------------------------------------- #
-# Languages, community and rate limiting
+# Language and rate limiting
 # --------------------------------------------------------------------------- #
-SUPPORTED_LANGS = ("fa", "en")
-DEFAULT_LANG = "fa"
-LANG_LABELS = {"fa": "فارسی", "en": "English"}
+SUPPORTED_LANGS = ("en",)
+DEFAULT_LANG = "en"
 
 USER_RATE_WINDOW_SECONDS = env_int("USER_RATE_WINDOW_SECONDS", 60)
 USER_RATE_MAX_MESSAGES = env_int("USER_RATE_MAX_MESSAGES", 3)
@@ -565,108 +566,51 @@ STATS_ACTIVE_DAYS = env_int("STATS_ACTIVE_DAYS", 30)
 
 
 # --------------------------------------------------------------------------- #
-# User-facing copy (Persian + English)
+# User-facing copy (English only)
 # --------------------------------------------------------------------------- #
-def detect_language(code: str | None) -> str:
-    """Map Telegram's ``language_code`` to a supported language.
-
-    Any code starting with ``fa`` is Persian; every other known code is English.
-    A missing code falls back to ``DEFAULT_LANG``.
-    """
-    text = str(code or "").strip().lower()
-    if text.startswith("fa"):
-        return "fa"
-    if text:
-        return "en"
-    return DEFAULT_LANG
-
-
-def language_name(lang: str) -> str:
-    return LANG_LABELS.get(lang, LANG_LABELS[DEFAULT_LANG])
-
-
-def choose_language_text(lang: str = "fa") -> str:
-    if lang == "en":
-        return "🌐 <b>Language</b>\n\nPlease choose the language for your news summaries."
-    return "🌐 <b>زبان</b>\n\nلطفاً زبان خلاصه‌های خبری خود را انتخاب کنید."
-
-
 def welcome_text(lang: str, chat_id: int | str) -> str:
-    if lang == "en":
-        return (
-            'Hello! 👋 Welcome to the news bot.\n'
-            'You have been registered successfully. ✅\n'
-            'News subscription: active\n'
-            '🌐 Language: English\n'
-            'Use /lang to change the language.'
-        )
     return (
-        'سلام! 👋 به ربات اخبار خوش آمدید.\n'
-        'شما با موفقیت ثبت‌نام شدید. ✅\n'
-        'اشتراک اخبار: فعال\n'
-        '🌐 زبان: فارسی\n'
-        'برای تغییر زبان /lang را بزنید.'
+        "Hello! 👋 Welcome to the news bot.\n"
+        "You have been registered successfully. ✅\n"
+        "News subscription: active\n"
+        "The bot sends news in English. Use /unsubscribe to stop."
     )
 
 
-def help_text(lang: str = "fa") -> str:
-    if lang == "en":
-        return (
-            "<b>Bot help</b>\n\n"
-            "/start — show settings and subscription status\n"
-            "/subscribe — turn news on\n"
-            "/unsubscribe — turn news off\n"
-            "/lang — change language\n"
-            "/help — this help\n\n"
-            "News is collected throughout the day and delivered in batches; "
-            "every news message is deleted after about 24 hours, while your "
-            "settings message stays."
-        )
+def help_text(lang: str = "en") -> str:
     return (
-        "<b>راهنمای ربات اخبار</b>\n\n"
-        "/start — نمایش تنظیمات و وضعیت اشتراک\n"
-        "/subscribe — فعال‌کردن اشتراک اخبار\n"
-        "/unsubscribe — غیرفعال‌کردن اشتراک اخبار\n"
-        "/lang — تغییر زبان\n"
-        "/help — همین راهنما\n\n"
-        "اخبار در طول روز جمع‌آوری و ارسال می‌شود؛ هر پیام خبری حدود ۲۴ ساعت بعد "
-        "حذف می‌شود اما پیام تنظیمات شما باقی می‌ماند."
+        "<b>Bot help</b>\n\n"
+        "/start — show settings and enable news\n"
+        "/subscribe — turn news on\n"
+        "/unsubscribe — turn news off\n"
+        "/help — this help\n\n"
+        "News is collected throughout the day and delivered in batches. "
+        "News messages are deleted after about 24 hours; settings messages stay."
     )
 
 
 def settings_text(lang: str, subscribed: bool) -> str:
-    if lang == "en":
-        state = "active ✅" if subscribed else "inactive ⛔"
-        return f"<b>Your settings</b>\n\nSubscription: {state}\n🌐 Language: English"
-    state = "فعال ✅" if subscribed else "غیرفعال ⛔"
-    return f"<b>تنظیمات شما</b>\n\nوضعیت اشتراک: {state}\n🌐 زبان: فارسی"
+    state = "active ✅" if subscribed else "inactive ⛔"
+    return f"<b>Your settings</b>\n\nSubscription: {state}\nNews language: English"
 
 
 def subscription_changed_text(lang: str, subscribed: bool) -> str:
-    if lang == "en":
-        return "News subscription is now active. ✅" if subscribed else "News subscription is now off. ⛔"
-    return "اشتراک اخبار فعال شد. ✅" if subscribed else "اشتراک اخبار غیرفعال شد. ⛔"
+    return "News subscription is now active. ✅" if subscribed else "News subscription is now off. ⛔"
 
 
 def toggle_subscription_text(lang: str, subscribed: bool) -> str:
-    if lang == "en":
-        return "Turn news off" if subscribed else "Turn news on"
-    return "غیرفعال‌کردن اشتراک" if subscribed else "فعال‌کردن اشتراک"
-
-
-def language_button_text(lang: str) -> str:
-    return "Language 🌐" if lang == "en" else "زبان 🌐"
+    return "Turn news off" if subscribed else "Turn news on"
 
 
 def help_button_text(lang: str) -> str:
-    return "Help" if lang == "en" else "راهنما"
+    return "Help"
 
 
-def main_keyboard(lang: str = "fa") -> dict:
+def main_keyboard(lang: str = "en") -> dict:
     """Persistent reply keyboard so /start is always one tap away."""
     return {
         "keyboard": [
-            [{"text": "/start"}, {"text": "/lang"}],
+            [{"text": "/start"}, {"text": "/help"}],
             [{"text": "/subscribe"}, {"text": "/unsubscribe"}],
         ],
         "resize_keyboard": True,
@@ -675,35 +619,19 @@ def main_keyboard(lang: str = "fa") -> dict:
 
 
 def hint_text(lang: str) -> str:
-    if lang == "en":
-        return "Use /start to see your settings."
-    return "برای مشاهده تنظیمات /start را بزنید"
+    return "Use /start to see your settings."
 
 
 def register_first_text(lang: str) -> str:
-    if lang == "en":
-        return "Please register first with /start."
-    return "ابتدا در ربات ثبت‌نام کنید: /start"
+    return "Please register first with /start."
 
 
 def join_required_hint_text(lang: str) -> str:
-    if lang == "en":
-        return "Please join the channel first, then tap the confirm button."
-    return "ابتدا عضو کانال شوید، سپس دکمهٔ تایید را بزنید."
+    return "Please join the channel first, then tap the confirm button."
 
 
 def joined_and_registered_text(lang: str) -> str:
-    if lang == "en":
-        return "Registered ✅"
-    return "ثبت‌نام شد ✅"
-
-
-def language_prompt_text(lang: str) -> str:
-    return choose_language_text(lang)
-
-
-def language_saved_text(lang: str) -> str:
-    return "Language set to English. ✅" if lang == "en" else "زبان روی فارسی تنظیم شد. ✅"
+    return "Registered ✅"
 
 
 def join_required_text(lang: str, channels: list[dict] | None = None) -> str:
@@ -716,27 +644,22 @@ def join_required_text(lang: str, channels: list[dict] | None = None) -> str:
         elif name:
             lines.append(f"📢 {name}")
     body = "\n".join(lines)
-    if lang == "en":
-        return (
-            "⚠️ To use zerobot, you must first join the channel below:\n\n"
-            f"{body}\n\nAfter joining, click the button below."
-        )
     return (
-        "⚠️ برای استفاده از zerobot، ابتدا باید عضو کانال زیر شوید:\n\n"
-        f"{body}\n\nپس از عضویت، دکمه زیر را بزنید."
+        "⚠️ To use zerobot, you must first join the channel below:\n\n"
+        f"{body}\n\nAfter joining, click the button below."
     )
 
 
 def confirm_join_text(lang: str) -> str:
-    return "✅ I've Joined" if lang == "en" else "✅ تایید عضویت"
+    return "✅ I've Joined"
 
 
 def join_confirmed_text(lang: str) -> str:
-    return "Membership confirmed. ✅" if lang == "en" else "عضویت تایید شد. ✅"
+    return "Membership confirmed. ✅"
 
 
 def join_again_text(lang: str) -> str:
-    return "Join the channel first, then press the button." if lang == "en" else "ابتدا در کانال عضو شوید، سپس دکمه را بزنید."
+    return "Join the channel first, then press the button."
 
 
 def stats_text(
@@ -746,82 +669,58 @@ def stats_text(
     active: int,
     days: int = STATS_ACTIVE_DAYS,
 ) -> str:
-    if lang == "en":
-        return (
-            "<b>Bot statistics</b>\n\n"
-            f"Total users: <code>{total}</code>\n"
-            f"Subscribed: <code>{subscribed}</code>\n"
-            f"Active in the last {days} days: <code>{active}</code>"
-        )
     return (
-        "<b>آمار کاربران</b>\n\n"
-        f"کل: <code>{total}</code>\n"
-        f"مشترک: <code>{subscribed}</code>\n"
-        f"فعال در {days} روز اخیر: <code>{active}</code>"
+        "<b>Bot statistics</b>\n\n"
+        f"Total users: <code>{total}</code>\n"
+        f"Subscribed: <code>{subscribed}</code>\n"
+        f"Active in the last {days} days: <code>{active}</code>"
     )
 
 
 def channel_added_text(lang: str, channel: str) -> str:
-    if lang == "en":
-        return f"✅ Channel <code>{channel}</code> was added to the required list."
-    return f"✅ کانال <code>{channel}</code> به لیست عضویت اجباری اضافه شد."
+    return f"✅ Channel <code>{channel}</code> was added to the required list."
 
 
 def channel_removed_text(lang: str, channel: str) -> str:
-    if lang == "en":
-        return f"🗑 Channel <code>{channel}</code> was removed from the list."
-    return f"🗑 کانال <code>{channel}</code> از لیست حذف شد."
+    return f"🗑 Channel <code>{channel}</code> was removed from the list."
 
 
 def channel_missing_text(lang: str, channel: str) -> str:
-    if lang == "en":
-        return f"❗️ Channel <code>{channel}</code> is not in the list."
-    return f"❗️ کانال <code>{channel}</code> در لیست نیست."
+    return f"❗️ Channel <code>{channel}</code> is not in the list."
 
 
 def channel_exists_text(lang: str, channel: str) -> str:
-    if lang == "en":
-        return f"ℹ️ Channel <code>{channel}</code> is already configured."
-    return f"ℹ️ کانال <code>{channel}</code> از قبل ثبت شده."
+    return f"ℹ️ Channel <code>{channel}</code> is already configured."
 
 
-def channel_usage_text(lang: str = "fa") -> str:
-    if lang == "en":
-        return (
-            "Usage: <code>/addchannel @channelusername</code> or "
-            "<code>/removechannel @channelusername</code>"
-        )
+def channel_usage_text(lang: str = "en") -> str:
     return (
-        "استفاده: <code>/addchannel @channelusername</code> یا "
+        "Usage: <code>/addchannel @channelusername</code> or "
         "<code>/removechannel @channelusername</code>"
     )
 
 
 def repo_warning(lang: str) -> str:
-    return REPO_WARNING_EN if lang == "en" else REPO_WARNING
+    return REPO_WARNING
 
 
 def ai_disclaimer(lang: str) -> str:
-    return AI_DISCLAIMER_EN if lang == "en" else AI_DISCLAIMER
+    return AI_DISCLAIMER
 
 
 def ai_disclaimer_no_ai(lang: str) -> str:
-    return AI_DISCLAIMER_NO_AI_EN if lang == "en" else AI_DISCLAIMER_NO_AI
+    return AI_DISCLAIMER_NO_AI
 
 
 def source_link_text(lang: str) -> str:
-    return "Read the full source" if lang == "en" else "مطالعه کامل منبع"
+    return "Read the full source"
 
 
-REPO_WARNING = "⚠️ <b>بررسی‌نشده:</b> ریپوی تازه‌ساز. قبل از اجرا کد را بخوانید."
-REPO_WARNING_EN = (
+REPO_WARNING = (
     "⚠️ <b>Unreviewed:</b> freshly created repository. Read the code before running it."
 )
-AI_DISCLAIMER = "خلاصه با AI تولید شده — منبع اصلی را بررسی کنید."
-AI_DISCLAIMER_EN = "AI-generated summary — verify the original source."
-AI_DISCLAIMER_NO_AI = "خلاصه خودکار (بدون AI) — منبع اصلی را بررسی کنید."
-AI_DISCLAIMER_NO_AI_EN = "Automatic summary (no AI) — verify the original source."
+AI_DISCLAIMER = "AI-generated summary — verify the original source."
+AI_DISCLAIMER_NO_AI = "Automatic summary (no AI) — verify the original source."
 QUOTA_NOTICE = (
-    "⚠️ سهمیه روزانه <code>Gemini</code> تمام شد؛ در این اجرا خلاصه‌های ساده "
-    "(عنوان + لینک) ارسال شد."
+    "⚠️ Gemini's daily quota is exhausted; plain summaries (title + link) were sent."
 )

@@ -16,152 +16,31 @@ from fetcher import Item
 log = logging.getLogger(__name__)
 
 
-SUMMARIZE_SYSTEM_PROMPT = """You are a Senior Cybersecurity & Bug Bounty Analyst with a second
-specialization in AI/LLM Security. You write for a Persian-speaking audience
-of professional bug bounty hunters, penetration testers, and AI red teamers.
+SUMMARIZE_SYSTEM_PROMPT = """You are a senior cybersecurity and AI-security analyst writing concise, accurate news summaries in English for professional security researchers.
 
-You will receive: TITLE, SOURCE, URL, and the FULL TEXT of an article,
-advisory, or repository README.
+Return SKIP only when the item is clearly unrelated, promotional, or has no substantive technical content. Do not reject useful security reporting merely because it is not an exploit write-up.
 
-DECISION:
-If the content is low-value, promotional, a beginner listicle ("Top 10 tools"),
-a generic career/marketing post, paywalled with no substantive text, or not
-technically about security or AI security, output exactly:
-SKIP
-Nothing else. No explanation, no punctuation, no quotes.
+Use the source title, publisher, URL, and full text. Translate non-English source material into natural, professional English. Preserve the exact meaning and distinguish reported facts from analysis. Never invent vulnerabilities, CVEs, versions, scores, vendors, endpoints, or payloads.
 
-Valuable content includes: real vulnerability write-ups, novel WAF/filter
-bypass techniques, CVE and zero-day analysis, exploit chains, bug bounty
-methodology with concrete payloads, and new offensive/defensive security or
-AI-security tooling.
+Return Telegram HTML only. Allowed tags: <b>, <i>, <code>, <pre>, <a href="...">, <blockquote>. Use real newlines, no Markdown, and keep the result under 900 characters. Escape HTML text and keep technical terms and short source payloads in <code> tags.
 
-LANGUAGE:
-You MUST respond ONLY in fluent Persian (Farsi) language.
-Write in fluent, natural, professional technical Persian.
-Keep ALL technical terms in English and wrap each in <code> tags:
-<code>XSS</code>, <code>SSRF</code>, <code>IDOR</code>, <code>RCE</code>,
-<code>SQLi</code>, <code>SSTI</code>, <code>WAF Bypass</code>,
-<code>Payload</code>, <code>Prompt Injection</code>, <code>Jailbreak</code>,
-<code>MCP</code>, <code>RAG Poisoning</code>, <code>CVE-2026-1234</code>.
-Never translate or transliterate these into Persian.
-Write Persian prose around them; do not write whole sentences in English.
+Use this structure:
+<b>[Concise English headline]</b>
+<b>Category:</b> [category] | <b>Source:</b> [publisher]
 
-OUTPUT FORMAT — Telegram HTML ONLY:
-Allowed tags: <b>, <i>, <code>, <pre>, <a href="...">, <blockquote>
-FORBIDDEN: <br>, <p>, <ul>, <li>, <h1>-<h6>, <div>, <span>, Markdown (** ## -).
-Use real newlines for line breaks, never <br>.
-Escape & < > inside text content. Never leave a tag unclosed.
-Total output MUST be under 900 characters.
+<b>Technical summary:</b>
+[Two or three concrete English sentences describing what happened or what the tool does.]
 
-Exact structure:
+<b>Key takeaway:</b>
+[One or two factual English sentences with the practical implication.]
 
-🔴 <b>[catchy Persian title]</b>
-📂 <b>دسته:</b> [category] | <b>منبع:</b> [source name]
+For GitHub repositories, add this warning before the source link:
+<b>Unreviewed:</b> freshly created repository. Read the code before running it.
 
-<b>🔍 سناریوی فنی:</b>
-[2-3 Persian sentences: how the bug actually worked, or what the tool actually
-does. Be concrete — name the endpoint, parameter, component, or model behavior.]
+<a href="[exact URL]">Read the full source</a>
+<i>AI-generated summary - verify the original source.</i>
 
-<b>💡 نکته کلیدی:</b>
-[1-2 Persian sentences: the bypass technique, exploitation vector, or the
-practical takeaway a hunter can reuse. Include the actual payload or command
-in <code> if one is present in the source.]
-
-🔗 <a href="[URL]">مطالعه کامل منبع</a>
-<i>خلاصه با AI تولید شده — منبع اصلی را بررسی کنید.</i>
-
-HARD RULES:
-1. NEVER invent a CVE ID, affected version, CVSS score, vendor name, or payload
-   that does not literally appear in the provided text. If a detail is missing,
-   omit it. Do not guess. Accuracy over completeness.
-2. If the item is a GitHub repository (especially one created in the last 7 days
-   claiming to be a PoC or exploit), append this exact line before the link:
-   ⚠️ <b>بررسی‌نشده:</b> ریپوی تازه‌ساز. قبل از اجرا کد را بخوانید.
-3. Use the URL exactly as provided. Never fabricate or shorten a link.
-4. No preamble, no "here is the summary", no closing remarks. Output only the
-   formatted message, or only SKIP.
-5. Do not reproduce more than a short payload snippet from the source.
-   Summarize in your own words; this must be a transformative summary.
-6. For AI-security items, be specific about the attack surface: direct vs
-   indirect <code>Prompt Injection</code>, tool/agent abuse, <code>MCP</code>
-   server trust boundaries, model supply chain, or guardrail bypass.
-   Avoid vague AI hype."""
-
-
-SUMMARIZE_SYSTEM_PROMPT_EN = """You are a Senior Cybersecurity & Bug Bounty Analyst with a second
-specialization in AI/LLM Security. You write for an English-speaking audience
-of professional bug bounty hunters, penetration testers, and AI red teamers.
-
-You will receive: TITLE, SOURCE, URL, and the FULL TEXT of an article,
-advisory, or repository README.
-
-DECISION:
-If the content is low-value, promotional, a beginner listicle ("Top 10 tools"),
-a generic career/marketing post, paywalled with no substantive text, or not
-technically about security or AI security, output exactly:
-SKIP
-Nothing else. No explanation, no punctuation, no quotes.
-
-Valuable content includes: real vulnerability write-ups, novel WAF/filter
-bypass techniques, CVE and zero-day analysis, exploit chains, bug bounty
-methodology with concrete payloads, and new offensive/defensive security or
-AI-security tooling.
-
-LANGUAGE:
-You MUST respond ONLY in English language.
-Write in fluent, natural, professional technical English.
-Keep ALL technical terms in English and wrap each in <code> tags:
-<code>XSS</code>, <code>SSRF</code>, <code>IDOR</code>, <code>RCE</code>,
-<code>SQLi</code>, <code>SSTI</code>, <code>WAF Bypass</code>,
-<code>Payload</code>, <code>Prompt Injection</code>, <code>Jailbreak</code>,
-<code>MCP</code>, <code>RAG Poisoning</code>, <code>CVE-2026-1234</code>.
-
-OUTPUT FORMAT — Telegram HTML ONLY:
-Allowed tags: <b>, <i>, <code>, <pre>, <a href="...">, <blockquote>
-FORBIDDEN: <br>, <p>, <ul>, <li>, <h1>-<h6>, <div>, <span>, Markdown (** ## -).
-Use real newlines for line breaks, never <br>.
-Escape & < > inside text content. Never leave a tag unclosed.
-Total output MUST be under 900 characters.
-
-Exact structure:
-
-🔴 <b>[catchy English title]</b>
-📂 <b>Category:</b> [category] | <b>Source:</b> [source name]
-
-<b>🔍 Technical scenario:</b>
-[2-3 English sentences: how the bug actually worked, or what the tool actually
-does. Be concrete — name the endpoint, parameter, component, or model behavior.]
-
-<b>💡 Key takeaway:</b>
-[1-2 English sentences: the bypass technique, exploitation vector, or the
-practical takeaway a hunter can reuse. Include the actual payload or command
-in <code> if one is present in the source.]
-
-🔗 <a href="[URL]">Read the full source</a>
-<i>AI-generated summary — verify the original source.</i>
-
-HARD RULES:
-1. NEVER invent a CVE ID, affected version, CVSS score, vendor name, or payload
-   that does not literally appear in the provided text. If a detail is missing,
-   omit it. Do not guess. Accuracy over completeness.
-2. If the item is a GitHub repository (especially one created in the last 7 days
-   claiming to be a PoC or exploit), append this exact line before the link:
-   ⚠️ <b>Unreviewed:</b> freshly created repository. Read the code before running it.
-3. Use the URL exactly as provided. Never fabricate or shorten a link.
-4. No preamble, no "here is the summary", no closing remarks. Output only the
-   formatted message, or only SKIP.
-5. Do not reproduce more than a short payload snippet from the source.
-   Summarize in your own words; this must be a transformative summary.
-6. For AI-security items, be specific about the attack surface: direct vs
-   indirect <code>Prompt Injection</code>, tool/agent abuse, <code>MCP</code>
-   server trust boundaries, model supply chain, or guardrail bypass.
-   Avoid vague AI hype."""
-
-SUMMARIZE_PROMPTS = {
-    "fa": SUMMARIZE_SYSTEM_PROMPT,
-    "en": SUMMARIZE_SYSTEM_PROMPT_EN,
-}
-
+Do not include a preamble or closing text. Be specific about AI-security attack surfaces and do not exaggerate the severity of a report."""
 
 TRIAGE_SYSTEM_PROMPT = """You are a Senior Cybersecurity & AI Security Analyst triaging a candidate list.
 
@@ -307,10 +186,7 @@ def _is_daily_quota(exc: Exception) -> bool:
     return "per day" in text or "daily" in text
 
 
-def fallback_summary(
-    item: Item, lang: str = "fa", note: str | None = None
-) -> str:
-    lang = "en" if lang == "en" else "fa"
+def fallback_summary(item: Item, note: str | None = None) -> str:
     title = html.escape(item.title)
     category = item.category or (
         "AI Security" if item.ai_related else "Classic Security"
@@ -318,30 +194,17 @@ def fallback_summary(
     source = html.escape(item.source_label)
     snippet = html.escape((item.summary or item.content or "")[:280].strip())
     link = html.escape(item.url, quote=True)
-    if lang == "en":
-        lines = [
-            f"🔴 <b>{title}</b>",
-            f"📂 <b>Category:</b> {category} | <b>Source:</b> {source}",
-            "",
-        ]
-        if snippet:
-            lines.extend(["<b>🔍 Summary:</b>", snippet, ""])
-        if item.is_repo:
-            lines.extend([config.repo_warning(lang), ""])
-        lines.append(f'🔗 <a href="{link}">{config.source_link_text(lang)}</a>')
-        lines.append(f"<i>{html.escape(note or config.ai_disclaimer_no_ai(lang))}</i>")
-        return "\n".join(lines)
     lines = [
-        f"🔴 <b>{title}</b>",
-        f"📂 <b>دسته:</b> {category} | <b>منبع:</b> {source}",
+        f"News: <b>{title}</b>",
+        f"<b>Category:</b> {category} | <b>Source:</b> {source}",
         "",
     ]
     if snippet:
-        lines.extend([f"<b>🔍 خلاصه:</b>", snippet, ""])
+        lines.extend(["<b>Summary:</b>", snippet, ""])
     if item.is_repo:
-        lines.extend([config.repo_warning(lang), ""])
-    lines.append(f'🔗 <a href="{link}">{config.source_link_text(lang)}</a>')
-    lines.append(f"<i>{html.escape(note or config.ai_disclaimer_no_ai(lang))}</i>")
+        lines.extend([config.repo_warning("en"), ""])
+    lines.append(f'<a href="{link}">{config.source_link_text("en")}</a>')
+    lines.append(f"<i>{html.escape(note or config.ai_disclaimer_no_ai('en'))}</i>")
     return "\n".join(lines)
 
 
@@ -529,10 +392,9 @@ class Analyzer:
         return [item for _, item in scored][: config.MAX_ITEMS_PER_RUN]
 
     # ------------------------------------------------------------------ #
-    def summarize(self, item: Item, lang: str = "fa") -> SummaryResult:
-        lang = "en" if lang == "en" else "fa"
+    def summarize(self, item: Item) -> SummaryResult:
         if len((item.content or "").strip()) < 60:
-            return SummaryResult("error", fallback_summary(item, lang))
+            return SummaryResult("error", fallback_summary(item))
         contents = (
             f"TITLE: {item.title}\n"
             f"SOURCE: {item.source_label}\n"
@@ -542,15 +404,15 @@ class Analyzer:
         try:
             raw = self._generate(
                 contents,
-                system=SUMMARIZE_PROMPTS[lang],
+                system=SUMMARIZE_SYSTEM_PROMPT,
                 temperature=config.SUMMARY_TEMPERATURE,
                 max_output_tokens=config.AI_MAX_OUTPUT_TOKENS,
             )
         except BudgetExhausted:
-            return SummaryResult("quota", fallback_summary(item, lang))
+            return SummaryResult("quota", fallback_summary(item))
         except AnalyzerError as exc:
             log.warning("summary failed source=%s err=%s", item.source_label, exc)
-            return SummaryResult("error", fallback_summary(item, lang))
+            return SummaryResult("error", fallback_summary(item))
 
         cleaned = (raw or "").strip()
         cleaned = re.sub(r"^```(?:html)?", "", cleaned, flags=re.IGNORECASE).strip()
@@ -560,27 +422,24 @@ class Analyzer:
             return SummaryResult("skip", "")
         if not cleaned:
             log.warning("summary empty source=%s", item.source_label)
-            return SummaryResult("error", fallback_summary(item, lang))
-        return SummaryResult("ok", self._postprocess(item, cleaned, lang))
+            return SummaryResult("error", fallback_summary(item))
+        return SummaryResult("ok", self._postprocess(item, cleaned))
 
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _postprocess(item: Item, text: str, lang: str = "fa") -> str:
+    def _postprocess(item: Item, text: str) -> str:
         if len(text) > 3900:
             cut = text.rfind("\n", 0, 3900)
             text = text[: cut if cut > 2000 else 3900].rstrip()
-        warning = config.repo_warning(lang)
-        if item.is_repo and ("بررسی‌نشده" not in text and "Unreviewed" not in text):
+        warning = config.repo_warning("en")
+        if item.is_repo and "Unreviewed" not in text:
             text += f"\n\n{warning}"
         if item.url and item.url not in text:
             link = html.escape(item.url, quote=True)
-            text += (
-                f'\n\n🔗 <a href="{link}">{config.source_link_text(lang)}</a>'
-            )
-        disclaimer = config.ai_disclaimer(lang)
-        if disclaimer not in text and "منبع اصلی را بررسی کنید" not in text:
-            if "verify the original source" not in text:
-                text += f"\n<i>{disclaimer}</i>"
+            text += f'\n\n🔗 <a href="{link}">{config.source_link_text("en")}</a>'
+        disclaimer = config.ai_disclaimer("en")
+        if "verify the original source" not in text:
+            text += f"\n<i>{disclaimer}</i>"
         return text.strip()
 
 

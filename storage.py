@@ -25,7 +25,7 @@ SCHEMA = (
         chat_id TEXT PRIMARY KEY,
         first_name TEXT NOT NULL DEFAULT '',
         username TEXT NOT NULL DEFAULT '',
-        language TEXT NOT NULL DEFAULT 'fa',
+        language TEXT NOT NULL DEFAULT 'en',
         is_subscribed INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL,
         last_seen TEXT NOT NULL,
@@ -163,16 +163,15 @@ class Database:
                 return {str(row["column_name"]) for row in cur.fetchall()}
 
     def _migrate(self) -> None:
-        """Upgrade databases created before the multi-language schema."""
+        """Upgrade older user schemas and normalize all users to English."""
         columns = self._columns("users")
-        if "language" in columns:
-            return
-        self.execute("ALTER TABLE users ADD COLUMN language TEXT NOT NULL DEFAULT 'fa'")
-        if "lang" in columns:
+        if "language" not in columns:
+            self.execute("ALTER TABLE users ADD COLUMN language TEXT NOT NULL DEFAULT 'en'")
+        if "lang" in columns and "language" not in columns:
             self.execute(
-                "UPDATE users SET language = lang WHERE lang IN ('fa', 'en')"
+                "UPDATE users SET language = lang WHERE lang = 'en'"
             )
-            log.info("migrated users.lang -> users.language")
+        self.execute("UPDATE users SET language = 'en' WHERE language <> 'en'")
 
     # -- queries ------------------------------------------------------- #
     def execute(self, sql: str, params: tuple | list = ()) -> int:
@@ -292,10 +291,7 @@ class UserStore:
         return ids
 
     def lang_of(self, chat_id: int | str) -> str:
-        user = self.get(chat_id)
-        if not user:
-            return ""
-        return str(user.get("language") or user.get("lang") or "")
+        return config.DEFAULT_LANG if self.get(chat_id) else ""
 
     def lang(self, chat_id: int | str, default: str | None = None) -> str:
         value = self.lang_of(chat_id)
@@ -322,7 +318,7 @@ class UserStore:
         stamp = iso(now)
         clean_name = (first_name or "").strip()[:64]
         clean_username = (username or "").lstrip("@")[:32]
-        initial_lang = language if language in config.SUPPORTED_LANGS else config.DEFAULT_LANG
+        initial_lang = config.DEFAULT_LANG
         existing = self.get(key)
         if existing is None:
             self.db.execute(
@@ -341,7 +337,7 @@ class UserStore:
 
     def set_language(self, chat_id: int | str, language: str) -> bool:
         key = _key(chat_id)
-        if key is None or language not in config.SUPPORTED_LANGS or self.read_only:
+        if key is None or language != config.DEFAULT_LANG or self.read_only:
             return False
         return (
             self.db.execute(
